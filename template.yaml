@@ -1,0 +1,600 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Description: AI Accountant + Credit Builder for Informal MSMEs
+
+Parameters:
+
+  TableName:
+    Type: String
+    Default: Transactions
+
+  AmplifyOrigin:
+    Type: String
+    Default: http://localhost:5173
+
+  BedrockModelId:
+    Type: String
+    Default: anthropic.claude-sonnet-4-20250514-v1:0
+
+  StageName:
+    Type: String
+    Default: Prod
+
+
+Globals:
+
+  Function:
+    Runtime: nodejs20.x
+    Timeout: 60
+    MemorySize: 512
+
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref TransactionsTable
+        UPLOAD_BUCKET: !Ref UploadBucket
+        BEDROCK_MODEL_ID: !Ref BedrockModelId
+        AWS_NODEJS_CONNECTION_REUSE_ENABLED: "1"
+
+
+Resources:
+
+  # ============================================================
+  # API GATEWAY
+  # ============================================================
+
+  AIAccountantApi:
+    Type: AWS::Serverless::Api
+
+    Properties:
+      Name: AIAccountantApi
+
+      StageName: !Ref StageName
+
+      EndpointConfiguration:
+        Type: REGIONAL
+
+      Cors:
+        AllowOrigin: !Sub "'${AmplifyOrigin}'"
+        AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+        AllowMethods: "'GET,POST,PUT,OPTIONS'"
+
+      
+
+  # ============================================================
+  # S3 UPLOAD BUCKET
+  # ============================================================
+
+  UploadBucket:
+    Type: AWS::S3::Bucket
+
+    Properties:
+
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+      CorsConfiguration:
+
+        CorsRules:
+
+          - AllowedOrigins:
+              - !Ref AmplifyOrigin
+              - http://localhost:5173
+
+            AllowedMethods:
+              - PUT
+              - GET
+              - HEAD
+
+            AllowedHeaders:
+              - '*'
+
+            ExposedHeaders:
+              - ETag
+
+
+  # ============================================================
+  # DYNAMODB TRANSACTIONS TABLE
+  # ============================================================
+
+  TransactionsTable:
+    Type: AWS::DynamoDB::Table
+
+    Properties:
+
+      TableName: !Ref TableName
+
+      BillingMode: PAY_PER_REQUEST
+
+      AttributeDefinitions:
+
+        - AttributeName: userId
+          AttributeType: S
+
+        - AttributeName: transactionId
+          AttributeType: S
+
+      KeySchema:
+
+        - AttributeName: userId
+          KeyType: HASH
+
+        - AttributeName: transactionId
+          KeyType: RANGE
+
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+      SSESpecification:
+        SSEEnabled: true
+
+
+  # ============================================================
+  # IAM ROLE FOR ALL LAMBDA FUNCTIONS
+  # ============================================================
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+
+    Properties:
+
+      RoleName: !Sub ai-accountant-lambda-role-${AWS::StackName}
+
+      AssumeRolePolicyDocument:
+
+        Version: '2012-10-17'
+
+        Statement:
+
+          - Effect: Allow
+
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+
+            Action:
+              - sts:AssumeRole
+
+
+      Policies:
+
+        # --------------------------------------------------------
+        # CLOUDWATCH LOGS
+        # --------------------------------------------------------
+
+        - PolicyName: CloudWatchLogs
+
+          PolicyDocument:
+
+            Version: '2012-10-17'
+
+            Statement:
+
+              - Effect: Allow
+
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+
+                Resource: '*'
+
+
+        # --------------------------------------------------------
+        # DYNAMODB
+        # --------------------------------------------------------
+
+        - PolicyName: DynamoDBAccess
+
+          PolicyDocument:
+
+            Version: '2012-10-17'
+
+            Statement:
+
+              - Effect: Allow
+
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:DeleteItem
+
+                Resource:
+                  - !GetAtt TransactionsTable.Arn
+
+
+        # --------------------------------------------------------
+        # S3
+        # --------------------------------------------------------
+
+        - PolicyName: S3Access
+
+          PolicyDocument:
+
+            Version: '2012-10-17'
+
+            Statement:
+
+              - Effect: Allow
+
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+
+                Resource:
+                  - !Sub '${UploadBucket.Arn}/*'
+
+
+              - Effect: Allow
+
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+
+                Resource:
+                  - !GetAtt UploadBucket.Arn
+
+
+        # --------------------------------------------------------
+        # TEXTRACT
+        # --------------------------------------------------------
+
+        - PolicyName: TextractAccess
+
+          PolicyDocument:
+
+            Version: '2012-10-17'
+
+            Statement:
+
+              - Effect: Allow
+
+                Action:
+                  - textract:AnalyzeExpense
+
+                Resource: '*'
+
+
+        # --------------------------------------------------------
+        # TRANSCRIBE
+        # --------------------------------------------------------
+
+        - PolicyName: TranscribeAccess
+
+          PolicyDocument:
+
+            Version: '2012-10-17'
+
+            Statement:
+
+              - Effect: Allow
+
+                Action:
+                  - transcribe:StartTranscriptionJob
+                  - transcribe:GetTranscriptionJob
+
+                Resource: '*'
+
+
+        # --------------------------------------------------------
+        # BEDROCK
+        # --------------------------------------------------------
+
+        - PolicyName: BedrockAccess
+
+          PolicyDocument:
+
+            Version: '2012-10-17'
+
+            Statement:
+
+              - Effect: Allow
+
+                Action:
+                  - bedrock:InvokeModel
+
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}'
+
+
+  # ============================================================
+  # 1. GET TRANSACTIONS
+  # ============================================================
+
+  GetTransactionsFunction:
+    Type: AWS::Serverless::Function
+
+    Properties:
+
+      FunctionName: ai-accountant-get-transactions
+
+      CodeUri: functions/getTransactions/
+
+      Handler: index.handler
+
+      Role: !GetAtt LambdaExecutionRole.Arn
+
+      Events:
+
+        GetTransactions:
+
+          Type: Api
+
+          Properties:
+
+            RestApiId: !Ref AIAccountantApi
+
+            Path: /transactions
+
+            Method: GET
+
+
+  # ============================================================
+  # 2. CREATE TRANSACTION
+  # ============================================================
+
+  CreateTransactionFunction:
+    Type: AWS::Serverless::Function
+
+    Properties:
+
+      FunctionName: ai-accountant-create-transaction
+
+      CodeUri: functions/createTransaction/
+
+      Handler: index.handler
+
+      Role: !GetAtt LambdaExecutionRole.Arn
+
+      Events:
+
+        CreateTransaction:
+
+          Type: Api
+
+          Properties:
+
+            RestApiId: !Ref AIAccountantApi
+
+            Path: /transactions
+
+            Method: POST
+
+
+  # ============================================================
+  # 3. UPDATE TRANSACTION
+  # ============================================================
+
+  UpdateTransactionFunction:
+    Type: AWS::Serverless::Function
+
+    Properties:
+
+      FunctionName: ai-accountant-update-transaction
+
+      CodeUri: functions/updateTransaction/
+
+      Handler: index.handler
+
+      Role: !GetAtt LambdaExecutionRole.Arn
+
+      Events:
+
+        UpdateTransaction:
+
+          Type: Api
+
+          Properties:
+
+            RestApiId: !Ref AIAccountantApi
+
+            Path: /transactions/{transactionId}
+
+            Method: PUT
+
+
+  # ============================================================
+  # 4. GET SUMMARY
+  # ============================================================
+
+  GetSummaryFunction:
+    Type: AWS::Serverless::Function
+
+    Properties:
+
+      FunctionName: ai-accountant-get-summary
+
+      CodeUri: functions/getSummary/
+
+      Handler: index.handler
+
+      Role: !GetAtt LambdaExecutionRole.Arn
+
+      Events:
+
+        GetSummary:
+
+          Type: Api
+
+          Properties:
+
+            RestApiId: !Ref AIAccountantApi
+
+            Path: /summary
+
+            Method: GET
+
+
+  # ============================================================
+  # 5. GET UPLOAD URL
+  # ============================================================
+
+  GetUploadURLFunction:
+    Type: AWS::Serverless::Function
+
+    Properties:
+
+      FunctionName: ai-accountant-get-upload-url
+
+      CodeUri: functions/getUploadURL/
+
+      Handler: index.handler
+
+      Role: !GetAtt LambdaExecutionRole.Arn
+
+      Events:
+
+        GetUploadURL:
+
+          Type: Api
+
+          Properties:
+
+            RestApiId: !Ref AIAccountantApi
+
+            Path: /upload-url
+
+            Method: POST
+
+
+  # ============================================================
+  # 6. PROCESS PHOTO
+  # ============================================================
+
+  ProcessPhotoFunction:
+    Type: AWS::Serverless::Function
+
+    Properties:
+
+      FunctionName: ai-accountant-process-photo
+
+      CodeUri: functions/processPhoto/
+
+      Handler: index.handler
+
+      Role: !GetAtt LambdaExecutionRole.Arn
+
+      Events:
+
+        ProcessPhoto:
+
+          Type: Api
+
+          Properties:
+
+            RestApiId: !Ref AIAccountantApi
+
+            Path: /process-photo
+
+            Method: POST
+
+
+  # ============================================================
+  # 7. PROCESS VOICE
+  # ============================================================
+
+  ProcessVoiceFunction:
+    Type: AWS::Serverless::Function
+
+    Properties:
+
+      FunctionName: ai-accountant-process-voice
+
+      CodeUri: functions/processVoice/
+
+      Handler: index.handler
+
+      Role: !GetAtt LambdaExecutionRole.Arn
+
+      Events:
+
+        ProcessVoice:
+
+          Type: Api
+
+          Properties:
+
+            RestApiId: !Ref AIAccountantApi
+
+            Path: /process-voice
+
+            Method: POST
+
+
+  # ============================================================
+  # 8. CREDIT READINESS
+  # ============================================================
+
+  CreditReadinessFunction:
+    Type: AWS::Serverless::Function
+
+    Properties:
+
+      FunctionName: ai-accountant-credit-readiness
+
+      CodeUri: functions/creditReadiness/
+
+      Handler: index.handler
+
+      Role: !GetAtt LambdaExecutionRole.Arn
+
+      Events:
+
+        CreditReadiness:
+
+          Type: Api
+
+          Properties:
+
+            RestApiId: !Ref AIAccountantApi
+
+            Path: /credit-readiness
+
+            Method: GET
+
+
+# ==============================================================
+# OUTPUTS
+# ==============================================================
+
+Outputs:
+
+  ApiUrl:
+
+    Description: API Gateway endpoint
+
+    Value: !Sub 'https://${AIAccountantApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}'
+
+
+  UploadBucketName:
+
+    Description: S3 upload bucket
+
+    Value: !Ref UploadBucket
+
+
+  TransactionsTableName:
+
+    Description: DynamoDB transactions table
+
+    Value: !Ref TransactionsTable
+
+
+  LambdaExecutionRoleArn:
+
+    Description: Lambda execution role
+
+    Value: !GetAtt LambdaExecutionRole.Arn
+
+
+  BedrockModel:
+
+    Description: Bedrock model ID
+
+    Value: !Ref BedrockModelId
