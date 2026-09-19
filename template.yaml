@@ -228,7 +228,6 @@ Resources:
                 Resource:
                   - !Sub '${UploadBucket.Arn}/*'
 
-
               - Effect: Allow
 
                 Action:
@@ -292,13 +291,32 @@ Resources:
 
             Statement:
 
+              # Allow Lambda to invoke Bedrock foundation models
+              # and inference profiles.
               - Effect: Allow
 
                 Action:
                   - bedrock:InvokeModel
 
                 Resource:
-                  - !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}'
+                  - !Sub 'arn:${AWS::Partition}:bedrock:*::foundation-model/*'
+                  - !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*'
+
+
+              # Allow Bedrock to automatically subscribe to
+              # third-party Marketplace models when required.
+              - Effect: Allow
+
+                Action:
+                  - aws-marketplace:Subscribe
+                  - aws-marketplace:ViewSubscriptions
+                  - aws-marketplace:Unsubscribe
+
+                Resource: '*'
+
+                Condition:
+                  StringEquals:
+                    aws:CalledViaLast: bedrock.amazonaws.com
 
 
   # ============================================================
