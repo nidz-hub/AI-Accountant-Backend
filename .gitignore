@@ -1,0 +1,11 @@
+node_modules/
+.aws-sam/
+
+.env
+.env.*
+!.env.example
+
+test.jpg
+test.png
+textract-test.json
+*.webm

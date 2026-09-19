@@ -25,7 +25,7 @@ Parameters:
 Globals:
 
   Function:
-    Runtime: nodejs20.x
+    Runtime: nodejs24.x
     Timeout: 60
     MemorySize: 512
 
@@ -59,7 +59,6 @@ Resources:
         AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
         AllowMethods: "'GET,POST,PUT,OPTIONS'"
 
-      
 
   # ============================================================
   # S3 UPLOAD BUCKET
@@ -82,7 +81,6 @@ Resources:
 
           - AllowedOrigins:
               - !Ref AmplifyOrigin
-              - http://localhost:5173
 
             AllowedMethods:
               - PUT
@@ -314,9 +312,9 @@ Resources:
 
       FunctionName: ai-accountant-get-transactions
 
-      CodeUri: functions/getTransactions/
+      CodeUri: ./
 
-      Handler: index.handler
+      Handler: functions/getTransactions/index.handler
 
       Role: !GetAtt LambdaExecutionRole.Arn
 
@@ -346,9 +344,9 @@ Resources:
 
       FunctionName: ai-accountant-create-transaction
 
-      CodeUri: functions/createTransaction/
+      CodeUri: ./
 
-      Handler: index.handler
+      Handler: functions/createTransaction/index.handler
 
       Role: !GetAtt LambdaExecutionRole.Arn
 
@@ -378,9 +376,9 @@ Resources:
 
       FunctionName: ai-accountant-update-transaction
 
-      CodeUri: functions/updateTransaction/
+      CodeUri: ./
 
-      Handler: index.handler
+      Handler: functions/updateTransaction/index.handler
 
       Role: !GetAtt LambdaExecutionRole.Arn
 
@@ -410,9 +408,9 @@ Resources:
 
       FunctionName: ai-accountant-get-summary
 
-      CodeUri: functions/getSummary/
+      CodeUri: ./
 
-      Handler: index.handler
+      Handler: functions/getSummary/index.handler
 
       Role: !GetAtt LambdaExecutionRole.Arn
 
@@ -442,9 +440,9 @@ Resources:
 
       FunctionName: ai-accountant-get-upload-url
 
-      CodeUri: functions/getUploadURL/
+      CodeUri: ./
 
-      Handler: index.handler
+      Handler: functions/getUploadURL/index.handler
 
       Role: !GetAtt LambdaExecutionRole.Arn
 
@@ -474,9 +472,9 @@ Resources:
 
       FunctionName: ai-accountant-process-photo
 
-      CodeUri: functions/processPhoto/
+      CodeUri: ./
 
-      Handler: index.handler
+      Handler: functions/processPhoto/index.handler
 
       Role: !GetAtt LambdaExecutionRole.Arn
 
@@ -506,9 +504,9 @@ Resources:
 
       FunctionName: ai-accountant-process-voice
 
-      CodeUri: functions/processVoice/
+      CodeUri: ./
 
-      Handler: index.handler
+      Handler: functions/processVoice/index.handler
 
       Role: !GetAtt LambdaExecutionRole.Arn
 
@@ -538,9 +536,9 @@ Resources:
 
       FunctionName: ai-accountant-credit-readiness
 
-      CodeUri: functions/creditReadiness/
+      CodeUri: ./
 
-      Handler: index.handler
+      Handler: functions/creditReadiness/index.handler
 
       Role: !GetAtt LambdaExecutionRole.Arn
 
