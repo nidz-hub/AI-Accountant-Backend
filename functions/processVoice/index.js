@@ -5,219 +5,371 @@ const {
 } = require("@aws-sdk/client-transcribe");
 
 const {
-  PutCommand
-} = require("@aws-sdk/lib-dynamodb");
+  S3Client,
+  GetObjectCommand
+} = require("@aws-sdk/client-s3");
+
+const {
+  DynamoDBClient,
+  PutItemCommand
+} = require("@aws-sdk/client-dynamodb");
 
 const crypto = require("crypto");
 
-const {
-  dynamoClient,
-  TABLE_NAME
-} = require("../../shared/dynamoClient");
-
+const { invokeBedrock } = require("../../shared/bedrockParse");
 const {
   validateTransaction,
   normalizeTransaction
 } = require("../../shared/transactionSchema");
-
-const {
-  invokeBedrock
-} = require("../../shared/bedrockParse");
-
-const {
-  success,
-  error
-} = require("../../shared/response");
+const { success, error } = require("../../shared/response");
 
 const transcribe = new TranscribeClient({});
+const s3 = new S3Client({});
+const dynamodb = new DynamoDBClient({});
 
-const LANGUAGE_CODE = "en-IN";
+const BUCKET_NAME = process.env.UPLOAD_BUCKET;
+const TABLE_NAME = process.env.TABLE_NAME;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function streamToString(stream) {
+  const chunks = [];
+
+  for await (const chunk of stream) {
+    chunks.push(Buffer.from(chunk));
+  }
+
+  return Buffer.concat(chunks).toString("utf-8");
+}
+
+function createFallbackTransaction(userId, transcript) {
+  const now = new Date().toISOString();
+
+  return {
+    transactionId: crypto.randomUUID(),
+    userId,
+    date: now,
+    type: "expense",
+    item: "Review voice entry",
+    quantity: 1,
+    unit: "entry",
+    pricePerUnit: 0,
+    totalAmount: 0,
+    currency: "INR",
+    counterparty: null,
+    source: "voice",
+    rawInput: transcript,
+    confidence: 0
+  };
+}
+
+function buildPrompt(transcript) {
+  return `
+You are parsing a voice transaction for a small informal Indian business.
+
+Convert the transcript into one or more transactions.
+
+Return ONLY valid JSON in this exact format:
+
+[
+  {
+    "date": "ISO-8601 date",
+    "type": "sale" | "expense" | "purchase",
+    "item": "string",
+    "quantity": number,
+    "unit": "string",
+    "pricePerUnit": number,
+    "totalAmount": number,
+    "currency": "INR",
+    "counterparty": "string or null",
+    "confidence": number
+  }
+]
+
+Rules:
+- Use INR.
+- "bought", "purchased", "paid for" usually means purchase or expense.
+- "sold", "sale", "received from customer" usually means sale.
+- Calculate totalAmount when quantity and pricePerUnit are available.
+- If information is missing, make a reasonable best effort.
+- confidence must be between 0 and 1.
+- Do not include markdown.
+- Do not include explanations.
+
+Transcript:
+${transcript}
+`;
+}
+
+async function parseTranscriptWithBedrock(transcript) {
+  const prompt = buildPrompt(transcript);
+
+  console.log("Sending transcript to Bedrock:", transcript);
+
+  const response = await invokeBedrock(prompt);
+
+  console.log("Raw Bedrock response:", JSON.stringify(response));
+
+  const text = response?.content?.[0]?.text;
+
+  if (!text) {
+    throw new Error("Bedrock returned no text");
+  }
+
+  let cleaned = text.trim();
+
+  if (cleaned.startsWith("```")) {
+    cleaned = cleaned
+      .replace(/^```json\s*/i, "")
+      .replace(/^```\s*/i, "")
+      .replace(/\s*```$/i, "")
+      .trim();
+  }
+
+  const parsed = JSON.parse(cleaned);
+
+  if (!Array.isArray(parsed)) {
+    throw new Error("Bedrock response is not an array");
+  }
+
+  return parsed;
+}
+
+async function saveTransaction(transaction) {
+  const normalized = normalizeTransaction(transaction);
+
+  const validation = validateTransaction(normalized);
+
+  if (!validation.valid) {
+    throw new Error(
+      `Invalid transaction: ${validation.errors.join(", ")}`
+    );
+  }
+
+  await dynamodb.send(
+    new PutItemCommand({
+      TableName: TABLE_NAME,
+      Item: {
+        userId: { S: normalized.userId },
+        transactionId: { S: normalized.transactionId },
+        date: { S: normalized.date },
+        type: { S: normalized.type },
+        item: { S: normalized.item },
+        quantity: { N: String(normalized.quantity) },
+        unit: { S: normalized.unit },
+        pricePerUnit: { N: String(normalized.pricePerUnit) },
+        totalAmount: { N: String(normalized.totalAmount) },
+        currency: { S: normalized.currency },
+        counterparty: {
+          S: normalized.counterparty || ""
+        },
+        source: { S: normalized.source },
+        rawInput: { S: normalized.rawInput },
+        confidence: { N: String(normalized.confidence) }
+      }
+    })
+  );
+
+  return normalized;
+}
+
+async function transcribeFromS3(s3Key) {
+  const jobName = `voice-${crypto.randomUUID()}`;
+
+  console.log("Starting transcription:", {
+    bucket: BUCKET_NAME,
+    s3Key
+  });
+
+  await transcribe.send(
+    new StartTranscriptionJobCommand({
+      TranscriptionJobName: jobName,
+      Media: {
+        MediaFileUri: `s3://${BUCKET_NAME}/${s3Key}`
+      },
+      MediaFormat: "webm",
+      MediaSampleRateHertz: 48000,
+      LanguageCode: "en-IN",
+      OutputBucketName: BUCKET_NAME
+    })
+  );
+
+  let transcriptUri;
+
+  for (let attempt = 0; attempt < 30; attempt++) {
+    await sleep(2000);
+
+    const result = await transcribe.send(
+      new GetTranscriptionJobCommand({
+        TranscriptionJobName: jobName
+      })
+    );
+
+    const job = result.TranscriptionJob;
+
+    console.log("Transcription status:", job?.TranscriptionJobStatus);
+
+    if (job?.TranscriptionJobStatus === "COMPLETED") {
+      transcriptUri = job.Transcript?.TranscriptFileUri;
+      break;
+    }
+
+    if (job?.TranscriptionJobStatus === "FAILED") {
+      throw new Error(
+        job.FailureReason || "Transcription job failed"
+      );
+    }
+  }
+
+  if (!transcriptUri) {
+    throw new Error("Transcription timed out");
+  }
+
+  console.log("Transcript URI:", transcriptUri);
+
+  const url = new URL(transcriptUri);
+
+  const bucket = url.hostname.split(".")[0];
+  const key = decodeURIComponent(
+    url.pathname.replace(/^\/+/, "")
+  );
+
+  const transcriptObject = await s3.send(
+    new GetObjectCommand({
+      Bucket: bucket,
+      Key: key
+    })
+  );
+
+  const transcriptJson = JSON.parse(
+    await streamToString(transcriptObject.Body)
+  );
+
+  const transcript =
+    transcriptJson?.results?.transcripts?.[0]?.transcript;
+
+  if (!transcript) {
+    throw new Error("Transcript text was empty");
+  }
+
+  return transcript;
+}
 
 exports.handler = async (event) => {
   try {
-    if (!TABLE_NAME) {
-      console.error("TABLE_NAME is not configured");
-      return error("Database is not configured", 500);
-    }
-
-    let body;
-
-    try {
-      let rawBody = event.body || "{}";
-
-      if (event.isBase64Encoded) {
-        rawBody = Buffer.from(rawBody, "base64").toString("utf-8");
-      }
-
-      body =
-        typeof rawBody === "string"
-          ? JSON.parse(rawBody)
-          : rawBody;
-    } catch (parseError) {
-      console.error("Invalid request JSON:", parseError);
-      return error("Request body must be valid JSON", 400);
-    }
+    const body = JSON.parse(event.body || "{}");
 
     const userId = body.userId;
     const s3Key = body.s3Key;
+    const suppliedTranscript = body.transcript;
 
     if (userId !== "demo-user") {
       return error("Invalid userId", 400);
     }
 
-    if (!s3Key) {
-      return error("s3Key is required", 400);
+    /*
+     * FALLBACK PATH
+     *
+     * If the browser already supplied a transcript,
+     * we do NOT call AWS Transcribe.
+     */
+    let transcript;
+
+    if (
+      typeof suppliedTranscript === "string" &&
+      suppliedTranscript.trim()
+    ) {
+      transcript = suppliedTranscript.trim();
+
+      console.log("Using supplied browser transcript");
+    } else {
+      /*
+       * ORIGINAL AWS TRANSCRIBE PATH
+       */
+      if (!s3Key) {
+        return error(
+          "Either transcript or s3Key is required",
+          400
+        );
+      }
+
+      if (!s3Key.startsWith(`uploads/${userId}/`)) {
+        return error("Invalid s3Key", 400);
+      }
+
+      transcript = await transcribeFromS3(s3Key);
     }
 
-    const expectedPrefix = `uploads/${userId}/`;
-
-    if (!s3Key.startsWith(expectedPrefix)) {
-      return error("Invalid s3Key", 400);
-    }
-
-    const bucketName = process.env.UPLOAD_BUCKET;
-
-    if (!bucketName) {
-      console.error("UPLOAD_BUCKET is not configured");
-      return error("Upload storage is not configured", 500);
-    }
-
-    console.log("Starting transcription:", {
-      bucket: bucketName,
-      s3Key
-    });
-
-    const jobName =
-      `ai-accountant-${crypto.randomUUID()}`;
-
-    const startCommand =
-      new StartTranscriptionJobCommand({
-        TranscriptionJobName: jobName,
-
-        Media: {
-          MediaFileUri:
-            `s3://${bucketName}/${s3Key}`
-        },
-
-        MediaFormat: "webm",
-
-        MediaSampleRateHertz: 48000,
-
-        LanguageCode: LANGUAGE_CODE,
-
-        OutputBucketName: bucketName
-      });
-
-    await transcribe.send(startCommand);
-
-    console.log("Transcription job started:", jobName);
-
-    const transcript =
-      await waitForTranscription(jobName);
-
-    console.log(
-      "Transcription result:",
-      transcript
-    );
-
-    if (!transcript) {
-      return error(
-        "Could not extract readable speech from the audio",
-        422
-      );
-    }
+    console.log("Final transcript:", transcript);
 
     let parsedTransactions;
 
     try {
-      const prompt =
-        buildParsingPrompt(transcript);
-
-      const bedrockResponse =
-        await invokeBedrock(prompt);
-
-      console.log(
-        "Raw Bedrock parser response:",
-        JSON.stringify(bedrockResponse)
+      parsedTransactions = await parseTranscriptWithBedrock(
+        transcript
       );
-
-      parsedTransactions =
-        extractTransactionsFromBedrock(
-          bedrockResponse
-        );
-
     } catch (bedrockError) {
       console.error(
         "Bedrock parsing failed:",
         bedrockError
       );
 
-      parsedTransactions = [
-        createFallbackTransaction(
-          userId,
-          transcript
-        )
-      ];
+      const fallback = createFallbackTransaction(
+        userId,
+        transcript
+      );
+
+      const saved = await saveTransaction(fallback);
+
+      return success({
+        transactions: [saved],
+        transcript
+      });
     }
 
-    const savedTransactions = [];
+    const transactions = [];
 
-    for (const transaction of parsedTransactions) {
-      const normalized =
-        normalizeTransaction({
-          ...transaction,
+    for (const parsed of parsedTransactions) {
+      const transaction = normalizeTransaction({
+        ...parsed,
+        transactionId: crypto.randomUUID(),
+        userId,
+        source: "voice",
+        rawInput: transcript
+      });
 
-          transactionId:
-            transaction.transactionId ||
-            crypto.randomUUID(),
-
-          userId,
-
-          source: "voice",
-
-          rawInput: transcript
-        });
-
-      const validation =
-        validateTransaction(normalized);
+      const validation = validateTransaction(transaction);
 
       if (!validation.valid) {
-        console.warn(
-          "Bedrock transaction failed validation:",
-          {
-            errors: validation.errors,
-            transaction: normalized
-          }
+        console.error(
+          "Invalid Bedrock transaction:",
+          validation.errors
         );
 
-        const fallback =
-          createFallbackTransaction(
-            userId,
-            transcript
-          );
+        const fallback = createFallbackTransaction(
+          userId,
+          transcript
+        );
 
-        await saveTransaction(fallback);
+        const saved = await saveTransaction(fallback);
 
-        savedTransactions.push(fallback);
-
+        transactions.push(saved);
         continue;
       }
 
-      await saveTransaction(normalized);
+      const saved = await saveTransaction(transaction);
 
-      savedTransactions.push(normalized);
+      transactions.push(saved);
     }
 
     return success({
-      transactions: savedTransactions,
+      transactions,
       transcript
     });
-
   } catch (err) {
-    console.error(
-      "processVoice error:",
-      err
-    );
+    console.error("processVoice error:", err);
 
     return error(
       "Unable to process the uploaded voice recording",
@@ -225,212 +377,3 @@ exports.handler = async (event) => {
     );
   }
 };
-
-
-async function waitForTranscription(jobName) {
-  const maxAttempts = 30;
-  const waitMilliseconds = 2000;
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const command =
-      new GetTranscriptionJobCommand({
-        TranscriptionJobName: jobName
-      });
-
-    const response =
-      await transcribe.send(command);
-
-    const job =
-      response.TranscriptionJob;
-
-    const status =
-      job?.TranscriptionJobStatus;
-
-    console.log(
-      `Transcription attempt ${attempt}: ${status}`
-    );
-
-    if (status === "COMPLETED") {
-      const transcriptUri =
-        job.Transcript?.TranscriptFileUri;
-
-      if (!transcriptUri) {
-        throw new Error(
-          "Transcription completed without transcript URI"
-        );
-      }
-
-      const transcriptResponse =
-        await fetch(transcriptUri);
-
-      if (!transcriptResponse.ok) {
-        throw new Error(
-          `Unable to download transcript: ${transcriptResponse.status}`
-        );
-      }
-
-      const transcriptJson =
-        await transcriptResponse.json();
-
-      const text =
-        transcriptJson?.results
-          ?.transcripts?.[0]?.transcript || "";
-
-      return text.trim();
-    }
-
-    if (status === "FAILED") {
-      throw new Error(
-        `Transcription failed: ${
-          job?.FailureReason || "Unknown reason"
-        }`
-      );
-    }
-
-    await new Promise(
-      (resolve) =>
-        setTimeout(resolve, waitMilliseconds)
-    );
-  }
-
-  throw new Error(
-    "Transcription timed out"
-  );
-}
-
-
-async function saveTransaction(transaction) {
-  await dynamoClient.send(
-    new PutCommand({
-      TableName: TABLE_NAME,
-      Item: transaction
-    })
-  );
-}
-
-
-function buildParsingPrompt(transcript) {
-  return `
-You are parsing a spoken business transaction for a small-business accounting application.
-
-Convert the spoken text into a JSON array of transactions.
-
-Each transaction MUST follow this structure:
-
-{
-  "date": "ISO-8601 date",
-  "type": "sale" | "expense" | "purchase",
-  "item": "string",
-  "quantity": number,
-  "unit": "string",
-  "pricePerUnit": number,
-  "totalAmount": number,
-  "currency": "INR",
-  "counterparty": "string or null",
-  "confidence": number
-}
-
-Rules:
-- Return ONLY valid JSON.
-- Return an array, even when there is only one transaction.
-- Use INR unless another currency is clearly spoken.
-- Use "purchase" for goods bought by the business.
-- Use "expense" for business costs such as rent, electricity or transport.
-- Use "sale" for goods or services sold by the business.
-- If a field cannot be determined, make a reasonable best guess and reduce confidence.
-- confidence must be between 0 and 1.
-- Do not invent unnecessary transactions.
-- totalAmount should represent the transaction total.
-- pricePerUnit should represent the unit price when it can be determined.
-- Interpret common Indian business speech naturally.
-- Return JSON only.
-
-Spoken transaction:
-
-${transcript}
-`;
-}
-
-
-function extractTransactionsFromBedrock(response) {
-  const text =
-    response?.content
-      ?.find(
-        (item) => item.type === "text"
-      )
-      ?.text || "";
-
-  if (!text) {
-    throw new Error(
-      "Bedrock returned no text"
-    );
-  }
-
-  const cleaned =
-    text
-      .replace(/```json/gi, "")
-      .replace(/```/g, "")
-      .trim();
-
-  let parsed;
-
-  try {
-    parsed = JSON.parse(cleaned);
-  } catch (parseError) {
-    console.error(
-      "Bedrock returned invalid JSON:",
-      cleaned
-    );
-
-    throw parseError;
-  }
-
-  if (
-    !Array.isArray(parsed) ||
-    parsed.length === 0
-  ) {
-    throw new Error(
-      "Bedrock did not return a valid transaction array"
-    );
-  }
-
-  return parsed;
-}
-
-
-function createFallbackTransaction(
-  userId,
-  rawText
-) {
-  return {
-    transactionId:
-      crypto.randomUUID(),
-
-    userId,
-
-    date:
-      new Date().toISOString(),
-
-    type: "expense",
-
-    item: "Review voice transaction",
-
-    quantity: 1,
-
-    unit: "item",
-
-    pricePerUnit: 0,
-
-    totalAmount: 0,
-
-    currency: "INR",
-
-    counterparty: null,
-
-    source: "voice",
-
-    rawInput: rawText,
-
-    confidence: 0
-  };
-}

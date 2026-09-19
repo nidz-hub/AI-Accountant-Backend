@@ -4,6 +4,11 @@ const {
 } = require("@aws-sdk/client-textract");
 
 const {
+  S3Client,
+  GetObjectCommand
+} = require("@aws-sdk/client-s3");
+
+const {
   PutCommand
 } = require("@aws-sdk/lib-dynamodb");
 
@@ -20,7 +25,8 @@ const {
 } = require("../../shared/transactionSchema");
 
 const {
-  invokeBedrock
+  invokeBedrock,
+  invokeBedrockWithImage
 } = require("../../shared/bedrockParse");
 
 const {
@@ -29,6 +35,7 @@ const {
 } = require("../../shared/response");
 
 const textract = new TextractClient({});
+const s3 = new S3Client({});
 
 const BUCKET_NAME = process.env.UPLOAD_BUCKET;
 
@@ -94,95 +101,183 @@ exports.handler = async (event) => {
     }
 
     // ---------------------------------------------------------
-    // 4. Send image to Amazon Textract
+    // 4. Try Amazon Textract first
     // ---------------------------------------------------------
 
-    console.log("Starting Textract analysis:", {
-      bucket: BUCKET_NAME,
-      s3Key
-    });
+    let extractedText = "";
+    let usedVisionFallback = false;
 
-    const textractCommand = new AnalyzeExpenseCommand({
-      Document: {
-        S3Object: {
-          Bucket: BUCKET_NAME,
-          Name: s3Key
+    try {
+      console.log("Starting Textract analysis:", {
+        bucket: BUCKET_NAME,
+        s3Key
+      });
+
+      const textractCommand = new AnalyzeExpenseCommand({
+        Document: {
+          S3Object: {
+            Bucket: BUCKET_NAME,
+            Name: s3Key
+          }
         }
-      }
-    });
+      });
 
-    const textractResponse =
-      await textract.send(textractCommand);
+      const textractResponse =
+        await textract.send(textractCommand);
 
-    console.log(
-      "Raw Textract response:",
-      JSON.stringify(textractResponse)
-    );
-
-    // ---------------------------------------------------------
-    // 5. Extract useful text
-    // ---------------------------------------------------------
-
-    const extractedText =
-      extractTextractText(textractResponse);
-
-    console.log(
-      "Extracted Textract text:",
-      extractedText
-    );
-
-    if (!extractedText) {
-      return error(
-        "Could not extract readable information from the image",
-        422
+      console.log(
+        "Raw Textract response:",
+        JSON.stringify(textractResponse)
       );
+
+      extractedText =
+        extractTextractText(textractResponse);
+
+      console.log(
+        "Extracted Textract text:",
+        extractedText
+      );
+
+      if (!extractedText) {
+        console.warn(
+          "Textract succeeded but returned no readable text. " +
+          "Using Bedrock Vision fallback."
+        );
+
+        usedVisionFallback = true;
+      }
+
+    } catch (textractError) {
+      console.error(
+        "Textract failed. Using Bedrock Vision fallback:",
+        textractError
+      );
+
+      usedVisionFallback = true;
     }
 
     // ---------------------------------------------------------
-    // 6. Parse receipt using Bedrock
+    // 5. Parse receipt
     // ---------------------------------------------------------
-
-    const prompt =
-      buildParsingPrompt(extractedText);
 
     let parsedTransactions;
 
-    try {
-      const bedrockResponse =
-        await invokeBedrock(prompt);
+    if (usedVisionFallback) {
+      // -------------------------------------------------------
+      // 5A. Bedrock Vision fallback
+      // -------------------------------------------------------
 
-      console.log(
-        "Raw Bedrock parser response:",
-        JSON.stringify(bedrockResponse)
-      );
-
-      parsedTransactions =
-        extractTransactionsFromBedrock(
-          bedrockResponse
+      try {
+        console.log(
+          "Downloading receipt image from S3 for Bedrock Vision"
         );
 
-    } catch (bedrockError) {
-      console.error(
-        "Bedrock parsing failed:",
-        bedrockError
-      );
+        const imageObject = await s3.send(
+          new GetObjectCommand({
+            Bucket: BUCKET_NAME,
+            Key: s3Key
+          })
+        );
 
-      // AI failure must not crash the request.
-      parsedTransactions = [
-        createFallbackTransaction(
-          userId,
-          extractedText
-        )
-      ];
+        const imageBuffer =
+          await streamToBuffer(imageObject.Body);
+
+        const imageBase64 =
+          imageBuffer.toString("base64");
+
+        const mediaType =
+          getImageMediaType(s3Key);
+
+        const visionPrompt =
+          buildVisionParsingPrompt();
+
+        console.log(
+          "Sending receipt image directly to Bedrock Vision"
+        );
+
+        const bedrockResponse =
+          await invokeBedrockWithImage(
+            visionPrompt,
+            imageBase64,
+            mediaType
+          );
+
+        console.log(
+          "Raw Bedrock Vision response:",
+          JSON.stringify(bedrockResponse)
+        );
+
+        parsedTransactions =
+          extractTransactionsFromBedrock(
+            bedrockResponse
+          );
+
+      } catch (visionError) {
+        console.error(
+          "Bedrock Vision fallback failed:",
+          visionError
+        );
+
+        parsedTransactions = [
+          createFallbackTransaction(
+            userId,
+            `Receipt image could not be automatically parsed: ${s3Key}`
+          )
+        ];
+      }
+
+    } else {
+      // -------------------------------------------------------
+      // 5B. Existing Textract → Bedrock text path
+      // -------------------------------------------------------
+
+      const prompt =
+        buildParsingPrompt(extractedText);
+
+      try {
+        console.log(
+          "Sending extracted receipt text to Bedrock"
+        );
+
+        const bedrockResponse =
+          await invokeBedrock(prompt);
+
+        console.log(
+          "Raw Bedrock parser response:",
+          JSON.stringify(bedrockResponse)
+        );
+
+        parsedTransactions =
+          extractTransactionsFromBedrock(
+            bedrockResponse
+          );
+
+      } catch (bedrockError) {
+        console.error(
+          "Bedrock parsing failed:",
+          bedrockError
+        );
+
+        parsedTransactions = [
+          createFallbackTransaction(
+            userId,
+            extractedText
+          )
+        ];
+      }
     }
 
     // ---------------------------------------------------------
-    // 7. Validate, normalize and save
+    // 6. Validate, normalize and save
     // ---------------------------------------------------------
 
     const savedTransactions = [];
 
     for (const transaction of parsedTransactions) {
+      const rawInput =
+        extractedText ||
+        "Receipt image processed using Bedrock Vision fallback";
+
       const normalized = normalizeTransaction({
         ...transaction,
 
@@ -191,8 +286,10 @@ exports.handler = async (event) => {
           crypto.randomUUID(),
 
         userId,
+
         source: "photo",
-        rawInput: extractedText
+
+        rawInput
       });
 
       const validation =
@@ -210,7 +307,7 @@ exports.handler = async (event) => {
         const fallback =
           createFallbackTransaction(
             userId,
-            extractedText
+            rawInput
           );
 
         await saveTransaction(fallback);
@@ -226,7 +323,7 @@ exports.handler = async (event) => {
     }
 
     // ---------------------------------------------------------
-    // 8. Return normalized transactions
+    // 7. Return normalized transactions
     // ---------------------------------------------------------
 
     return success({
@@ -258,6 +355,40 @@ async function saveTransaction(transaction) {
       Item: transaction
     })
   );
+}
+
+
+// =============================================================
+// Convert S3 image stream to Buffer
+// =============================================================
+
+async function streamToBuffer(stream) {
+  const chunks = [];
+
+  for await (const chunk of stream) {
+    chunks.push(Buffer.from(chunk));
+  }
+
+  return Buffer.concat(chunks);
+}
+
+
+// =============================================================
+// Determine image media type
+// =============================================================
+
+function getImageMediaType(s3Key) {
+  const lowerKey = s3Key.toLowerCase();
+
+  if (lowerKey.endsWith(".png")) {
+    return "image/png";
+  }
+
+  if (lowerKey.endsWith(".webp")) {
+    return "image/webp";
+  }
+
+  return "image/jpeg";
 }
 
 
@@ -322,7 +453,7 @@ function extractTextractText(response) {
 
 
 // =============================================================
-// Bedrock prompt
+// Bedrock prompt for Textract text
 // =============================================================
 
 function buildParsingPrompt(extractedText) {
@@ -362,6 +493,48 @@ Rules:
 Extracted receipt text:
 
 ${extractedText}
+`;
+}
+
+
+// =============================================================
+// Bedrock Vision prompt
+// =============================================================
+
+function buildVisionParsingPrompt() {
+  return `
+You are parsing a small-business receipt or bill for an accounting application.
+
+Analyze the receipt image and convert it into a JSON array of transactions.
+
+Each transaction MUST follow this structure:
+
+{
+  "date": "ISO-8601 date",
+  "type": "sale" | "expense" | "purchase",
+  "item": "string",
+  "quantity": number,
+  "unit": "string",
+  "pricePerUnit": number,
+  "totalAmount": number,
+  "currency": "INR",
+  "counterparty": "string or null",
+  "confidence": number
+}
+
+Rules:
+- Return ONLY valid JSON.
+- Return an array, even when there is only one transaction.
+- Use INR unless another currency is clearly visible.
+- For purchases of goods used by the business, use "purchase".
+- For business costs such as electricity, transport or rent, use "expense".
+- Use "sale" when the receipt represents goods or services sold by the business.
+- Read the visible receipt carefully.
+- If a field cannot be determined, make a reasonable best guess and reduce confidence.
+- confidence must be between 0 and 1.
+- Do not invent unnecessary transactions.
+- totalAmount should represent the transaction total.
+- pricePerUnit should represent the unit price when it can be determined.
 `;
 }
 
@@ -416,7 +589,7 @@ function extractTransactionsFromBedrock(response) {
 
 
 // =============================================================
-// Fallback when Bedrock fails
+// Fallback when AI parsing fails
 // =============================================================
 
 function createFallbackTransaction(
