@@ -4,8 +4,7 @@ const {
 } = require("@aws-sdk/client-textract");
 
 const {
-  S3Client,
-  GetObjectCommand
+  S3Client
 } = require("@aws-sdk/client-s3");
 
 const {
@@ -23,11 +22,6 @@ const {
   validateTransaction,
   normalizeTransaction
 } = require("../../shared/transactionSchema");
-
-const {
-  invokeBedrock,
-  invokeBedrockWithImage
-} = require("../../shared/bedrockParse");
 
 const {
   success,
@@ -73,9 +67,7 @@ exports.handler = async (event) => {
           ? JSON.parse(rawBody)
           : rawBody;
     } catch (parseError) {
-      console.error("Invalid request JSON:", event.body);
-      console.error("JSON parse error:", parseError);
-
+      console.error("Invalid request JSON:", parseError);
       return error("Request body must be valid JSON", 400);
     }
 
@@ -101,233 +93,151 @@ exports.handler = async (event) => {
     }
 
     // ---------------------------------------------------------
-    // 4. Try Amazon Textract first
+    // 4. Analyze invoice/receipt using Textract
     // ---------------------------------------------------------
 
-    let extractedText = "";
-    let usedVisionFallback = false;
+    console.log("Starting Textract expense analysis:", {
+      bucket: BUCKET_NAME,
+      s3Key
+    });
 
-    try {
-      console.log("Starting Textract analysis:", {
-        bucket: BUCKET_NAME,
-        s3Key
-      });
-
-      const textractCommand = new AnalyzeExpenseCommand({
+    const textractResponse = await textract.send(
+      new AnalyzeExpenseCommand({
         Document: {
           S3Object: {
             Bucket: BUCKET_NAME,
             Name: s3Key
           }
         }
-      });
+      })
+    );
 
-      const textractResponse =
-        await textract.send(textractCommand);
+    console.log(
+      "Raw Textract response:",
+      JSON.stringify(textractResponse)
+    );
 
-      console.log(
-        "Raw Textract response:",
-        JSON.stringify(textractResponse)
+    const expenseDocuments =
+      textractResponse.ExpenseDocuments || [];
+
+    if (expenseDocuments.length === 0) {
+      return error(
+        "No receipt or invoice data was detected",
+        422
       );
-
-      extractedText =
-        extractTextractText(textractResponse);
-
-      console.log(
-        "Extracted Textract text:",
-        extractedText
-      );
-
-      if (!extractedText) {
-        console.warn(
-          "Textract succeeded but returned no readable text. " +
-          "Using Bedrock Vision fallback."
-        );
-
-        usedVisionFallback = true;
-      }
-
-    } catch (textractError) {
-      console.error(
-        "Textract failed. Using Bedrock Vision fallback:",
-        textractError
-      );
-
-      usedVisionFallback = true;
     }
 
     // ---------------------------------------------------------
-    // 5. Parse receipt
+    // 5. Convert Textract line items directly to transactions
     // ---------------------------------------------------------
 
-    let parsedTransactions;
+    const transactions = [];
 
-    if (usedVisionFallback) {
+    for (const document of expenseDocuments) {
+      const summary =
+        extractSummaryFields(document);
+
+      const lineItems =
+        extractLineItems(document);
+
+      console.log(
+        "Textract summary fields:",
+        summary
+      );
+
+      console.log(
+        "Textract line items:",
+        JSON.stringify(lineItems)
+      );
+
       // -------------------------------------------------------
-      // 5A. Bedrock Vision fallback
-      // -------------------------------------------------------
-
-      try {
-        console.log(
-          "Downloading receipt image from S3 for Bedrock Vision"
-        );
-
-        const imageObject = await s3.send(
-          new GetObjectCommand({
-            Bucket: BUCKET_NAME,
-            Key: s3Key
-          })
-        );
-
-        const imageBuffer =
-          await streamToBuffer(imageObject.Body);
-
-        const imageBase64 =
-          imageBuffer.toString("base64");
-
-        const mediaType =
-          getImageMediaType(s3Key);
-
-        const visionPrompt =
-          buildVisionParsingPrompt();
-
-        console.log(
-          "Sending receipt image directly to Bedrock Vision"
-        );
-
-        const bedrockResponse =
-          await invokeBedrockWithImage(
-            visionPrompt,
-            imageBase64,
-            mediaType
-          );
-
-        console.log(
-          "Raw Bedrock Vision response:",
-          JSON.stringify(bedrockResponse)
-        );
-
-        parsedTransactions =
-          extractTransactionsFromBedrock(
-            bedrockResponse
-          );
-
-      } catch (visionError) {
-        console.error(
-          "Bedrock Vision fallback failed:",
-          visionError
-        );
-
-        parsedTransactions = [
-          createFallbackTransaction(
-            userId,
-            `Receipt image could not be automatically parsed: ${s3Key}`
-          )
-        ];
-      }
-
-    } else {
-      // -------------------------------------------------------
-      // 5B. Existing Textract → Bedrock text path
+      // Normal invoice/receipt with line items
       // -------------------------------------------------------
 
-      const prompt =
-        buildParsingPrompt(extractedText);
+      if (lineItems.length > 0) {
+        for (const lineItem of lineItems) {
+          const transaction =
+            buildTransactionFromLineItem({
+              userId,
+              summary,
+              lineItem
+            });
 
-      try {
-        console.log(
-          "Sending extracted receipt text to Bedrock"
-        );
+          const normalized =
+            normalizeTransaction(transaction);
 
-        const bedrockResponse =
-          await invokeBedrock(prompt);
+          const validation =
+            validateTransaction(normalized);
 
-        console.log(
-          "Raw Bedrock parser response:",
-          JSON.stringify(bedrockResponse)
-        );
+          if (!validation.valid) {
+            console.warn(
+              "Skipping invalid Textract line item:",
+              validation.errors,
+              normalized
+            );
 
-        parsedTransactions =
-          extractTransactionsFromBedrock(
-            bedrockResponse
-          );
-
-      } catch (bedrockError) {
-        console.error(
-          "Bedrock parsing failed:",
-          bedrockError
-        );
-
-        parsedTransactions = [
-          createFallbackTransaction(
-            userId,
-            extractedText
-          )
-        ];
-      }
-    }
-
-    // ---------------------------------------------------------
-    // 6. Validate, normalize and save
-    // ---------------------------------------------------------
-
-    const savedTransactions = [];
-
-    for (const transaction of parsedTransactions) {
-      const rawInput =
-        extractedText ||
-        "Receipt image processed using Bedrock Vision fallback";
-
-      const normalized = normalizeTransaction({
-        ...transaction,
-
-        transactionId:
-          transaction.transactionId ||
-          crypto.randomUUID(),
-
-        userId,
-
-        source: "photo",
-
-        rawInput
-      });
-
-      const validation =
-        validateTransaction(normalized);
-
-      if (!validation.valid) {
-        console.warn(
-          "Bedrock transaction failed validation:",
-          {
-            errors: validation.errors,
-            transaction: normalized
+            continue;
           }
-        );
 
-        const fallback =
-          createFallbackTransaction(
-            userId,
-            rawInput
-          );
+          await saveTransaction(normalized);
 
-        await saveTransaction(fallback);
-
-        savedTransactions.push(fallback);
-
-        continue;
+          transactions.push(normalized);
+        }
       }
 
-      await saveTransaction(normalized);
+      // -------------------------------------------------------
+      // Receipt without line items
+      // -------------------------------------------------------
 
-      savedTransactions.push(normalized);
+      else {
+        const transaction =
+          buildTransactionFromSummary({
+            userId,
+            summary
+          });
+
+        const normalized =
+          normalizeTransaction(transaction);
+
+        const validation =
+          validateTransaction(normalized);
+
+        if (!validation.valid) {
+          console.error(
+            "Textract summary transaction failed validation:",
+            validation.errors,
+            normalized
+          );
+
+          return error(
+            "Could not extract a valid transaction from the receipt",
+            422
+          );
+        }
+
+        await saveTransaction(normalized);
+
+        transactions.push(normalized);
+      }
     }
 
     // ---------------------------------------------------------
-    // 7. Return normalized transactions
+    // 6. Ensure something was extracted
+    // ---------------------------------------------------------
+
+    if (transactions.length === 0) {
+      return error(
+        "Could not extract any transaction items from the receipt",
+        422
+      );
+    }
+
+    // ---------------------------------------------------------
+    // 7. Return transactions
     // ---------------------------------------------------------
 
     return success({
-      transactions: savedTransactions
+      transactions
     });
 
   } catch (err) {
@@ -335,6 +245,17 @@ exports.handler = async (event) => {
       "processPhoto error:",
       err
     );
+
+    // Explicitly handle AWS service access problems.
+    if (
+      err?.name === "SubscriptionRequiredException" ||
+      err?.name === "AccessDeniedException"
+    ) {
+      return error(
+        "Receipt processing is temporarily unavailable because Amazon Textract access is not enabled for this AWS account yet.",
+        503
+      );
+    }
 
     return error(
       "Unable to process the uploaded photo",
@@ -359,243 +280,180 @@ async function saveTransaction(transaction) {
 
 
 // =============================================================
-// Convert S3 image stream to Buffer
+// Extract summary fields
 // =============================================================
 
-async function streamToBuffer(stream) {
-  const chunks = [];
+function extractSummaryFields(document) {
+  const fields = {};
 
-  for await (const chunk of stream) {
-    chunks.push(Buffer.from(chunk));
+  for (const field of document.SummaryFields || []) {
+    const type =
+      String(field.Type?.Text || "")
+        .trim()
+        .toUpperCase();
+
+    const value =
+      String(
+        field.ValueDetection?.Text ||
+        field.LabelDetection?.Text ||
+        ""
+      ).trim();
+
+    if (!type || !value) {
+      continue;
+    }
+
+    fields[type] = value;
   }
 
-  return Buffer.concat(chunks);
+  return fields;
 }
 
 
 // =============================================================
-// Determine image media type
+// Extract invoice line items
 // =============================================================
 
-function getImageMediaType(s3Key) {
-  const lowerKey = s3Key.toLowerCase();
-
-  if (lowerKey.endsWith(".png")) {
-    return "image/png";
-  }
-
-  if (lowerKey.endsWith(".webp")) {
-    return "image/webp";
-  }
-
-  return "image/jpeg";
-}
-
-
-// =============================================================
-// Extract text from Textract AnalyzeExpense response
-// =============================================================
-
-function extractTextractText(response) {
-  const parts = [];
+function extractLineItems(document) {
+  const items = [];
 
   for (
-    const document
-    of response.ExpenseDocuments || []
+    const group
+    of document.LineItemGroups || []
   ) {
     for (
-      const field
-      of document.SummaryFields || []
+      const lineItem
+      of group.LineItems || []
     ) {
-      const label =
-        field.Type?.Text || "";
+      const fields = {};
 
-      const value =
-        field.ValueDetection?.Text || "";
-
-      if (label && value) {
-        parts.push(`${label}: ${value}`);
-      } else if (value) {
-        parts.push(value);
-      }
-    }
-
-    for (
-      const group
-      of document.LineItemGroups || []
-    ) {
       for (
-        const lineItem
-        of group.LineItems || []
+        const field
+        of lineItem.LineItemExpenseFields || []
       ) {
-        for (
-          const field
-          of lineItem.LineItemExpenseFields || []
-        ) {
-          const label =
-            field.Type?.Text || "";
+        const type =
+          String(field.Type?.Text || "")
+            .trim()
+            .toUpperCase();
 
-          const value =
-            field.ValueDetection?.Text || "";
+        const value =
+          String(
+            field.ValueDetection?.Text ||
+            field.LabelDetection?.Text ||
+            ""
+          ).trim();
 
-          if (label && value) {
-            parts.push(`${label}: ${value}`);
-          } else if (value) {
-            parts.push(value);
-          }
+        const confidence =
+          Number(
+            field.ValueDetection?.Confidence || 0
+          );
+
+        if (!type || !value) {
+          continue;
         }
+
+        fields[type] = {
+          value,
+          confidence
+        };
+      }
+
+      if (Object.keys(fields).length > 0) {
+        items.push(fields);
       }
     }
   }
 
-  return parts.join("\n").trim();
+  return items;
 }
 
 
 // =============================================================
-// Bedrock prompt for Textract text
+// Build transaction from line item
 // =============================================================
 
-function buildParsingPrompt(extractedText) {
-  return `
-You are parsing a small-business receipt or bill for an accounting application.
-
-Convert the extracted receipt text into a JSON array of transactions.
-
-Each transaction MUST follow this structure:
-
-{
-  "date": "ISO-8601 date",
-  "type": "sale" | "expense" | "purchase",
-  "item": "string",
-  "quantity": number,
-  "unit": "string",
-  "pricePerUnit": number,
-  "totalAmount": number,
-  "currency": "INR",
-  "counterparty": "string or null",
-  "confidence": number
-}
-
-Rules:
-- Return ONLY valid JSON.
-- Return an array, even when there is only one transaction.
-- Use INR unless the receipt clearly specifies another currency.
-- For purchases of goods used by the business, use "purchase".
-- For business costs such as electricity, transport or rent, use "expense".
-- Use "sale" when the receipt represents goods or services sold by the business.
-- If a field cannot be determined, make a reasonable best guess and reduce confidence.
-- confidence must be between 0 and 1.
-- Do not invent unnecessary transactions.
-- totalAmount should represent the transaction total.
-- pricePerUnit should represent the unit price when it can be determined.
-
-Extracted receipt text:
-
-${extractedText}
-`;
-}
-
-
-// =============================================================
-// Bedrock Vision prompt
-// =============================================================
-
-function buildVisionParsingPrompt() {
-  return `
-You are parsing a small-business receipt or bill for an accounting application.
-
-Analyze the receipt image and convert it into a JSON array of transactions.
-
-Each transaction MUST follow this structure:
-
-{
-  "date": "ISO-8601 date",
-  "type": "sale" | "expense" | "purchase",
-  "item": "string",
-  "quantity": number,
-  "unit": "string",
-  "pricePerUnit": number,
-  "totalAmount": number,
-  "currency": "INR",
-  "counterparty": "string or null",
-  "confidence": number
-}
-
-Rules:
-- Return ONLY valid JSON.
-- Return an array, even when there is only one transaction.
-- Use INR unless another currency is clearly visible.
-- For purchases of goods used by the business, use "purchase".
-- For business costs such as electricity, transport or rent, use "expense".
-- Use "sale" when the receipt represents goods or services sold by the business.
-- Read the visible receipt carefully.
-- If a field cannot be determined, make a reasonable best guess and reduce confidence.
-- confidence must be between 0 and 1.
-- Do not invent unnecessary transactions.
-- totalAmount should represent the transaction total.
-- pricePerUnit should represent the unit price when it can be determined.
-`;
-}
-
-
-// =============================================================
-// Extract transactions from Bedrock response
-// =============================================================
-
-function extractTransactionsFromBedrock(response) {
-  const text =
-    response?.content
-      ?.find(
-        (item) => item.type === "text"
-      )
-      ?.text || "";
-
-  if (!text) {
-    throw new Error(
-      "Bedrock returned no text"
-    );
-  }
-
-  const cleaned = text
-    .replace(/```json/gi, "")
-    .replace(/```/g, "")
-    .trim();
-
-  let parsed;
-
-  try {
-    parsed = JSON.parse(cleaned);
-  } catch (parseError) {
-    console.error(
-      "Bedrock returned invalid JSON:",
-      cleaned
-    );
-
-    throw parseError;
-  }
-
-  if (
-    !Array.isArray(parsed) ||
-    parsed.length === 0
-  ) {
-    throw new Error(
-      "Bedrock did not return a valid transaction array"
-    );
-  }
-
-  return parsed;
-}
-
-
-// =============================================================
-// Fallback when AI parsing fails
-// =============================================================
-
-function createFallbackTransaction(
+function buildTransactionFromLineItem({
   userId,
-  rawText
-) {
+  summary,
+  lineItem
+}) {
+  const item =
+    getFieldValue(lineItem, [
+      "ITEM",
+      "EXPENSE_ROW_ITEM",
+      "DESCRIPTION"
+    ]) || "Unknown item";
+
+  const rawQuantity =
+    getFieldValue(lineItem, [
+      "QUANTITY",
+      "QTY"
+    ]);
+
+  const parsedQuantity =
+    parseQuantity(rawQuantity);
+
+  const quantity =
+    parsedQuantity.quantity || 1;
+
+  const unit =
+    parsedQuantity.unit || "item";
+
+  const unitPrice =
+    parseMoney(
+      getFieldValue(lineItem, [
+        "UNIT_PRICE",
+        "RATE"
+      ])
+    );
+
+  const linePrice =
+    parseMoney(
+      getFieldValue(lineItem, [
+        "PRICE",
+        "AMOUNT",
+        "TOTAL"
+      ])
+    );
+
+  const totalAmount =
+    linePrice !== null
+      ? linePrice
+      : unitPrice !== null
+        ? roundMoney(
+            unitPrice * quantity
+          )
+        : 0;
+
+  const pricePerUnit =
+    unitPrice !== null
+      ? unitPrice
+      : quantity > 0 &&
+        totalAmount !== 0
+        ? roundMoney(
+            totalAmount / quantity
+          )
+        : 0;
+
+  const confidenceValues =
+    Object.values(lineItem)
+      .map(
+        (field) =>
+          Number(field.confidence)
+      )
+      .filter(
+        (value) =>
+          Number.isFinite(value) &&
+          value > 0
+      );
+
+  const confidence =
+    confidenceValues.length > 0
+      ? roundConfidence(
+          average(confidenceValues) / 100
+        )
+      : 0.7;
+
   return {
     transactionId:
       crypto.randomUUID(),
@@ -603,28 +461,439 @@ function createFallbackTransaction(
     userId,
 
     date:
-      new Date().toISOString(),
+      parseDate(
+        summary.INVOICE_RECEIPT_DATE
+      ),
 
-    type: "expense",
+    type:
+      detectTransactionType(
+        summary
+      ),
 
-    item: "Review receipt",
+    item:
+      cleanItem(item),
 
-    quantity: 1,
+    quantity,
 
-    unit: "item",
+    unit,
 
-    pricePerUnit: 0,
+    pricePerUnit,
 
-    totalAmount: 0,
+    totalAmount,
 
-    currency: "INR",
+    currency:
+      "INR",
 
-    counterparty: null,
+    counterparty:
+      getCounterparty(summary),
 
-    source: "photo",
+    source:
+      "photo",
 
-    rawInput: rawText,
+    rawInput:
+      buildRawInput(
+        summary,
+        lineItem
+      ),
 
-    confidence: 0
+    confidence
   };
+}
+
+
+// =============================================================
+// Build transaction when no line items are available
+// =============================================================
+
+function buildTransactionFromSummary({
+  userId,
+  summary
+}) {
+  const total =
+    parseMoney(
+      summary.TOTAL ||
+      summary.AMOUNT_DUE ||
+      summary.AMOUNT_DUE_TO_VENDOR ||
+      summary.SUBTOTAL
+    );
+
+  const item =
+    summary.DESCRIPTION ||
+    summary.ITEM ||
+    "Receipt total";
+
+  return {
+    transactionId:
+      crypto.randomUUID(),
+
+    userId,
+
+    date:
+      parseDate(
+        summary.INVOICE_RECEIPT_DATE
+      ),
+
+    type:
+      detectTransactionType(
+        summary
+      ),
+
+    item:
+      cleanItem(item),
+
+    quantity:
+      1,
+
+    unit:
+      "invoice",
+
+    pricePerUnit:
+      total !== null
+        ? total
+        : 0,
+
+    totalAmount:
+      total !== null
+        ? total
+        : 0,
+
+    currency:
+      "INR",
+
+    counterparty:
+      getCounterparty(summary),
+
+    source:
+      "photo",
+
+    rawInput:
+      Object.entries(summary)
+        .map(
+          ([key, value]) =>
+            `${key}: ${value}`
+        )
+        .join("\n"),
+
+    confidence:
+      total !== null
+        ? 0.8
+        : 0.5
+  };
+}
+
+
+// =============================================================
+// Get a field from line item
+// =============================================================
+
+function getFieldValue(
+  lineItem,
+  names
+) {
+  for (const name of names) {
+    if (lineItem[name]?.value) {
+      return lineItem[name].value;
+    }
+  }
+
+  return null;
+}
+
+
+// =============================================================
+// Parse quantity
+// =============================================================
+
+function parseQuantity(value) {
+  if (!value) {
+    return {
+      quantity: 1,
+      unit: "item"
+    };
+  }
+
+  const text =
+    String(value).trim();
+
+  const match =
+    text.match(
+      /([0-9]+(?:[.,][0-9]+)?)\s*([A-Za-z]+)?/
+    );
+
+  if (!match) {
+    return {
+      quantity: 1,
+      unit: "item"
+    };
+  }
+
+  const quantity =
+    Number(
+      match[1].replace(/,/g, "")
+    );
+
+  const unit =
+    normalizeUnit(match[2]);
+
+  return {
+    quantity:
+      Number.isFinite(quantity) &&
+      quantity > 0
+        ? quantity
+        : 1,
+
+    unit
+  };
+}
+
+
+// =============================================================
+// Normalize units
+// =============================================================
+
+function normalizeUnit(value) {
+  const unit =
+    String(value || "")
+      .trim()
+      .toLowerCase();
+
+  const map = {
+    nos: "nos",
+    no: "nos",
+
+    pcs: "piece",
+    pc: "piece",
+    pieces: "piece",
+    piece: "piece",
+
+    kg: "kg",
+    kgs: "kg",
+    kilogram: "kg",
+    kilograms: "kg",
+
+    g: "g",
+    gm: "g",
+    gram: "g",
+    grams: "g",
+
+    l: "litre",
+    litre: "litre",
+    litres: "litre",
+    liter: "litre",
+    liters: "litre",
+
+    ml: "ml",
+
+    bag: "bag",
+    bags: "bag",
+
+    box: "box",
+    boxes: "box",
+
+    packet: "packet",
+    packets: "packet"
+  };
+
+  return (
+    map[unit] ||
+    unit ||
+    "item"
+  );
+}
+
+
+// =============================================================
+// Parse monetary value
+// =============================================================
+
+function parseMoney(value) {
+  if (
+    value === null ||
+    value === undefined
+  ) {
+    return null;
+  }
+
+  const text =
+    String(value)
+      .replace(/[₹$€£]/g, "")
+      .replace(/INR/gi, "")
+      .replace(/Rs\.?/gi, "")
+      .replace(/,/g, "")
+      .trim();
+
+  const match =
+    text.match(
+      /-?\d+(?:\.\d+)?/
+    );
+
+  if (!match) {
+    return null;
+  }
+
+  const number =
+    Number(match[0]);
+
+  return Number.isFinite(number)
+    ? roundMoney(number)
+    : null;
+}
+
+
+// =============================================================
+// Parse invoice date
+// =============================================================
+
+function parseDate(value) {
+  if (!value) {
+    return new Date().toISOString();
+  }
+
+  const parsed =
+    new Date(value);
+
+  if (
+    Number.isNaN(
+      parsed.getTime()
+    )
+  ) {
+    return new Date().toISOString();
+  }
+
+  return parsed.toISOString();
+}
+
+
+// =============================================================
+// Detect transaction type
+// =============================================================
+
+function detectTransactionType(summary) {
+  const hasVendor =
+    Boolean(
+      summary.VENDOR_NAME ||
+      summary.VENDOR_ADDRESS ||
+      summary.VENDOR_GST_NUMBER
+    );
+
+  const hasCustomer =
+    Boolean(
+      summary.CUSTOMER_NAME ||
+      summary.RECEIVER_NAME ||
+      summary.BILL_TO_NAME
+    );
+
+  if (
+    hasVendor &&
+    !hasCustomer
+  ) {
+    return "purchase";
+  }
+
+  if (
+    hasCustomer &&
+    !hasVendor
+  ) {
+    return "sale";
+  }
+
+  return "purchase";
+}
+
+
+// =============================================================
+// Counterparty
+// =============================================================
+
+function getCounterparty(summary) {
+  return (
+    summary.VENDOR_NAME ||
+    summary.CUSTOMER_NAME ||
+    summary.RECEIVER_NAME ||
+    summary.BILL_TO_NAME ||
+    null
+  );
+}
+
+
+// =============================================================
+// Clean item name
+// =============================================================
+
+function cleanItem(value) {
+  return String(
+    value || "Unknown item"
+  )
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+
+// =============================================================
+// Raw input for audit/debugging
+// =============================================================
+
+function buildRawInput(
+  summary,
+  lineItem
+) {
+  const summaryText =
+    Object.entries(summary)
+      .map(
+        ([key, value]) =>
+          `${key}: ${value}`
+      )
+      .join(" | ");
+
+  const lineText =
+    Object.entries(lineItem)
+      .map(
+        ([key, field]) =>
+          `${key}: ${field.value}`
+      )
+      .join(" | ");
+
+  return [
+    summaryText,
+    lineText
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+
+// =============================================================
+// Helpers
+// =============================================================
+
+function roundMoney(value) {
+  return (
+    Math.round(
+      value * 100
+    ) / 100
+  );
+}
+
+function roundConfidence(value) {
+  return (
+    Math.round(
+      value * 100
+    ) / 100
+  );
+}
+
+function average(values) {
+  if (
+    values.length === 0
+  ) {
+    return 0;
+  }
+
+  return (
+    values.reduce(
+      (sum, value) =>
+        sum + value,
+      0
+    ) / values.length
+  );
 }
