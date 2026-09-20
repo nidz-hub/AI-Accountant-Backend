@@ -17,11 +17,16 @@ const {
 const crypto = require("crypto");
 
 const { invokeBedrock } = require("../../shared/bedrockParse");
+
 const {
   validateTransaction,
   normalizeTransaction
 } = require("../../shared/transactionSchema");
-const { success, error } = require("../../shared/response");
+
+const {
+  success,
+  error
+} = require("../../shared/response");
 
 const transcribe = new TranscribeClient({});
 const s3 = new S3Client({});
@@ -30,8 +35,15 @@ const dynamodb = new DynamoDBClient({});
 const BUCKET_NAME = process.env.UPLOAD_BUCKET;
 const TABLE_NAME = process.env.TABLE_NAME;
 
+
+// ============================================================
+// Utility
+// ============================================================
+
 function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  return new Promise((resolve) =>
+    setTimeout(resolve, ms)
+  );
 }
 
 async function streamToString(stream) {
@@ -44,11 +56,201 @@ async function streamToString(stream) {
   return Buffer.concat(chunks).toString("utf-8");
 }
 
-/*
- * ============================================================
- * BEDROCK PROMPT
- * ============================================================
- */
+
+// ============================================================
+// ITEM NORMALIZATION
+//
+// This is intentionally deterministic.
+// It runs regardless of whether the transaction came from:
+//
+// Bedrock
+// Local parser
+// AWS Transcribe
+// Browser transcript
+//
+// Examples:
+// potatoes -> potato
+// tomatoes -> tomato
+// onions -> onion
+// apples -> apple
+// bananas -> banana
+// biscuits -> biscuit
+// boxes -> box
+// packets -> packet
+//
+// rawInput is NOT changed.
+// ============================================================
+
+function normalizeItemName(item) {
+  if (
+    item === null ||
+    item === undefined
+  ) {
+    return item;
+  }
+
+  let value = String(item)
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+
+  if (!value) {
+    return value;
+  }
+
+  // Explicit irregular / important grocery forms.
+  const irregular = {
+    potatoes: "potato",
+    tomatoes: "tomato",
+    mangoes: "mango",
+    mangoes: "mango",
+    children: "child",
+    people: "person",
+    men: "man",
+    women: "woman",
+    leaves: "leaf",
+    knives: "knife",
+    loaves: "loaf",
+    wives: "wife",
+    lives: "life",
+    shelves: "shelf",
+    halves: "half",
+    calves: "calf"
+  };
+
+  if (irregular[value]) {
+    return irregular[value];
+  }
+
+  // Words that should not be singularized.
+  const unchanged = new Set([
+    "rice",
+    "wheat",
+    "milk",
+    "water",
+    "sugar",
+    "salt",
+    "flour",
+    "oil",
+    "gas",
+    "glass",
+    "grass",
+    "bread",
+    "fish",
+    "dal",
+    "tea",
+    "coffee",
+    "curd",
+    "soap",
+    "cash",
+    "business",
+    "address"
+  ]);
+
+  function singularizeWord(word) {
+    if (!word) {
+      return word;
+    }
+
+    if (unchanged.has(word)) {
+      return word;
+    }
+
+    if (irregular[word]) {
+      return irregular[word];
+    }
+
+    // berries -> berry
+    if (
+      word.endsWith("ies") &&
+      word.length > 3
+    ) {
+      return word.slice(0, -3) + "y";
+    }
+
+    // stories -> story
+    if (
+      word.endsWith("ies") &&
+      word.length > 3
+    ) {
+      return word.slice(0, -3) + "y";
+    }
+
+    // boxes -> box
+    // dishes -> dish
+    // buses -> bus
+    // classes -> class
+    if (
+      word.endsWith("ches") ||
+      word.endsWith("shes") ||
+      word.endsWith("xes") ||
+      word.endsWith("zes") ||
+      word.endsWith("sses")
+    ) {
+      return word.slice(0, -2);
+    }
+
+    // potatoes and tomatoes were explicitly handled above.
+    // General -oes handling:
+    // heroes -> hero
+    // mangoes -> mango
+    if (
+      word.endsWith("oes") &&
+      word.length > 3
+    ) {
+      return word.slice(0, -2);
+    }
+
+    // Remove simple plural s.
+    //
+    // Do not change:
+    // gas
+    // glass
+    // business
+    //
+    // because they are handled by `unchanged`.
+    if (
+      word.endsWith("s") &&
+      !word.endsWith("ss") &&
+      word.length > 2
+    ) {
+      return word.slice(0, -1);
+    }
+
+    return word;
+  }
+
+  /*
+   * Normalize every word in the item, but perform
+   * singularization primarily on the final noun.
+   *
+   * Examples:
+   *
+   * "cooking oils" -> "cooking oil"
+   * "wheat flours" -> "wheat flour"
+   * "red onions"  -> "red onion"
+   * "potatoes"    -> "potato"
+   */
+
+  const words = value.split(" ");
+
+  if (words.length === 1) {
+    return singularizeWord(words[0]);
+  }
+
+  const lastWord = words.pop();
+
+  words.push(
+    singularizeWord(lastWord)
+  );
+
+  return words.join(" ");
+}
+
+
+// ============================================================
+// BEDROCK PROMPT
+// ============================================================
 
 function buildPrompt(transcript) {
   return `
@@ -89,19 +291,36 @@ Rules:
 - Do not include Markdown.
 - Do not include explanations.
 
+IMPORTANT ITEM RULE:
+- Return item names in lowercase.
+- Return the item in singular canonical form whenever possible.
+- Do not use plural item names.
+- Examples:
+  potatoes -> potato
+  tomatoes -> tomato
+  onions -> onion
+  apples -> apple
+  bananas -> banana
+  biscuits -> biscuit
+  eggs -> egg
+  boxes -> box
+  packets -> packet
+  mangoes -> mango
+- Preserve the original user sentence only in rawInput.
+
 Transcript:
 ${transcript}
 `;
 }
 
-/*
- * ============================================================
- * BEDROCK JSON HELPERS
- * ============================================================
- */
+
+// ============================================================
+// BEDROCK JSON HELPERS
+// ============================================================
 
 function cleanBedrockText(text) {
-  let cleaned = String(text || "").trim();
+  let cleaned = String(text || "")
+    .trim();
 
   cleaned = cleaned
     .replace(/^```json\s*/i, "")
@@ -113,159 +332,297 @@ function cleanBedrockText(text) {
 }
 
 function extractJsonFromText(text) {
-  const cleaned = cleanBedrockText(text);
+  const cleaned =
+    cleanBedrockText(text);
 
+  // Direct JSON
   try {
     return JSON.parse(cleaned);
   } catch (_) {
     // Continue.
   }
 
-  const arrayStart = cleaned.indexOf("[");
-  const arrayEnd = cleaned.lastIndexOf("]");
+  // JSON array embedded in text
+  const arrayStart =
+    cleaned.indexOf("[");
 
-  if (arrayStart !== -1 && arrayEnd > arrayStart) {
+  const arrayEnd =
+    cleaned.lastIndexOf("]");
+
+  if (
+    arrayStart !== -1 &&
+    arrayEnd > arrayStart
+  ) {
     try {
       return JSON.parse(
-        cleaned.slice(arrayStart, arrayEnd + 1)
+        cleaned.slice(
+          arrayStart,
+          arrayEnd + 1
+        )
       );
     } catch (_) {
       // Continue.
     }
   }
 
-  const objectStart = cleaned.indexOf("{");
-  const objectEnd = cleaned.lastIndexOf("}");
+  // JSON object embedded in text
+  const objectStart =
+    cleaned.indexOf("{");
 
-  if (objectStart !== -1 && objectEnd > objectStart) {
+  const objectEnd =
+    cleaned.lastIndexOf("}");
+
+  if (
+    objectStart !== -1 &&
+    objectEnd > objectStart
+  ) {
     try {
       return JSON.parse(
-        cleaned.slice(objectStart, objectEnd + 1)
+        cleaned.slice(
+          objectStart,
+          objectEnd + 1
+        )
       );
     } catch (_) {
       // Continue.
     }
   }
 
-  throw new Error("Unable to parse Bedrock JSON response");
+  throw new Error(
+    "Unable to parse Bedrock JSON response"
+  );
 }
 
-function normalizeParsedTransaction(parsed, transcript) {
+
+// ============================================================
+// NORMALIZE PARSED BEDROCK TRANSACTION
+// ============================================================
+
+function normalizeParsedTransaction(
+  parsed,
+  transcript
+) {
   const transaction = {
     ...parsed
   };
 
-  const typeText = String(transaction.type || "")
-    .trim()
-    .toLowerCase();
+  // -------------------------
+  // Normalize transaction type
+  // -------------------------
+
+  const typeText =
+    String(
+      transaction.type || ""
+    )
+      .trim()
+      .toLowerCase();
 
   if (
-    ["buy", "bought", "purchase", "purchased"].includes(
-      typeText
-    )
+    [
+      "buy",
+      "bought",
+      "purchase",
+      "purchased"
+    ].includes(typeText)
   ) {
-    transaction.type = "purchase";
+    transaction.type =
+      "purchase";
   } else if (
-    ["sell", "sold", "sale", "selling"].includes(
-      typeText
-    )
+    [
+      "sell",
+      "sold",
+      "sale",
+      "selling"
+    ].includes(typeText)
   ) {
-    transaction.type = "sale";
+    transaction.type =
+      "sale";
   } else if (
-    ["expense", "spent", "paid"].includes(typeText)
+    [
+      "expense",
+      "spent",
+      "paid"
+    ].includes(typeText)
   ) {
-    transaction.type = "expense";
+    transaction.type =
+      "expense";
   }
 
-  transaction.currency = "INR";
+  // -------------------------
+  // Normalize item
+  // -------------------------
 
-  transaction.quantity = Number(transaction.quantity);
-  transaction.pricePerUnit = Number(
-    transaction.pricePerUnit
-  );
-  transaction.totalAmount = Number(
-    transaction.totalAmount
-  );
+  transaction.item =
+    normalizeItemName(
+      transaction.item
+    );
+
+  // -------------------------
+  // Currency
+  // -------------------------
+
+  transaction.currency =
+    "INR";
+
+  // -------------------------
+  // Numbers
+  // -------------------------
+
+  transaction.quantity =
+    Number(transaction.quantity);
+
+  transaction.pricePerUnit =
+    Number(
+      transaction.pricePerUnit
+    );
+
+  transaction.totalAmount =
+    Number(
+      transaction.totalAmount
+    );
+
+  // -------------------------
+  // Calculate price per unit
+  // -------------------------
 
   if (
-    Number.isFinite(transaction.quantity) &&
+    Number.isFinite(
+      transaction.quantity
+    ) &&
     transaction.quantity > 0 &&
-    Number.isFinite(transaction.totalAmount) &&
+    Number.isFinite(
+      transaction.totalAmount
+    ) &&
     transaction.totalAmount >= 0 &&
-    (!Number.isFinite(transaction.pricePerUnit) ||
-      transaction.pricePerUnit < 0)
+    (
+      !Number.isFinite(
+        transaction.pricePerUnit
+      ) ||
+      transaction.pricePerUnit < 0
+    )
   ) {
     transaction.pricePerUnit =
-      transaction.totalAmount / transaction.quantity;
+      transaction.totalAmount /
+      transaction.quantity;
   }
 
+  // -------------------------
+  // Calculate total amount
+  // -------------------------
+
   if (
-    Number.isFinite(transaction.quantity) &&
+    Number.isFinite(
+      transaction.quantity
+    ) &&
     transaction.quantity > 0 &&
-    Number.isFinite(transaction.pricePerUnit) &&
+    Number.isFinite(
+      transaction.pricePerUnit
+    ) &&
     transaction.pricePerUnit >= 0 &&
-    (!Number.isFinite(transaction.totalAmount) ||
-      transaction.totalAmount < 0)
+    (
+      !Number.isFinite(
+        transaction.totalAmount
+      ) ||
+      transaction.totalAmount < 0
+    )
   ) {
     transaction.totalAmount =
       transaction.quantity *
       transaction.pricePerUnit;
   }
 
-  if (Number.isFinite(transaction.pricePerUnit)) {
+  // -------------------------
+  // Round monetary values
+  // -------------------------
+
+  if (
+    Number.isFinite(
+      transaction.pricePerUnit
+    )
+  ) {
     transaction.pricePerUnit =
       Math.round(
         transaction.pricePerUnit * 100
       ) / 100;
   }
 
-  if (Number.isFinite(transaction.totalAmount)) {
+  if (
+    Number.isFinite(
+      transaction.totalAmount
+    )
+  ) {
     transaction.totalAmount =
       Math.round(
         transaction.totalAmount * 100
       ) / 100;
   }
 
+  // -------------------------
+  // Counterparty
+  // -------------------------
+
   if (
-    transaction.counterparty === undefined ||
-    transaction.counterparty === "" ||
-    transaction.counterparty === "null"
+    transaction.counterparty ===
+      undefined ||
+    transaction.counterparty ===
+      "" ||
+    String(
+      transaction.counterparty
+    ).toLowerCase() === "null"
   ) {
-    transaction.counterparty = null;
+    transaction.counterparty =
+      null;
   }
 
-  let confidence = Number(
-    transaction.confidence
-  );
+  // -------------------------
+  // Confidence
+  // -------------------------
 
-  if (!Number.isFinite(confidence)) {
+  let confidence =
+    Number(
+      transaction.confidence
+    );
+
+  if (
+    !Number.isFinite(
+      confidence
+    )
+  ) {
     confidence = 0.5;
   }
 
-  transaction.confidence = Math.max(
-    0,
-    Math.min(1, confidence)
-  );
+  transaction.confidence =
+    Math.max(
+      0,
+      Math.min(
+        1,
+        confidence
+      )
+    );
+
+  // -------------------------
+  // Date
+  // -------------------------
 
   if (!transaction.date) {
     transaction.date =
       new Date().toISOString();
   }
 
-  transaction.rawInput = transcript;
+  // -------------------------
+  // Preserve exact transcript
+  // -------------------------
+
+  transaction.rawInput =
+    transcript;
 
   return transaction;
 }
 
-/*
- * ============================================================
- * LOCAL VOICE PARSER
- *
- * This is the emergency/demo-safe fallback.
- *
- * It does NOT depend on Bedrock.
- * ============================================================
- */
+
+// ============================================================
+// MONEY PARSER
+// ============================================================
 
 function parseMoney(text) {
   const patterns = [
@@ -276,15 +633,23 @@ function parseMoney(text) {
     /\b([0-9][0-9,]*(?:\.[0-9]+)?)\s*(?:rupees?|rs)\b/i
   ];
 
-  for (const pattern of patterns) {
-    const match = text.match(pattern);
+  for (
+    const pattern
+    of patterns
+  ) {
+    const match =
+      text.match(pattern);
 
     if (match) {
-      const value = Number(
-        String(match[1]).replace(/,/g, "")
-      );
+      const value =
+        Number(
+          String(match[1])
+            .replace(/,/g, "")
+        );
 
-      if (Number.isFinite(value)) {
+      if (
+        Number.isFinite(value)
+      ) {
         return value;
       }
     }
@@ -293,10 +658,16 @@ function parseMoney(text) {
   return null;
 }
 
+
+// ============================================================
+// UNIT NORMALIZATION
+// ============================================================
+
 function normalizeUnit(unit) {
-  const u = String(unit || "")
-    .trim()
-    .toLowerCase();
+  const u =
+    String(unit || "")
+      .trim()
+      .toLowerCase();
 
   const units = {
     kg: "kg",
@@ -319,6 +690,8 @@ function normalizeUnit(unit) {
     ml: "ml",
     millilitre: "ml",
     millilitres: "ml",
+    milliliter: "ml",
+    milliliters: "ml",
 
     piece: "piece",
     pieces: "piece",
@@ -334,10 +707,53 @@ function normalizeUnit(unit) {
     packets: "packet"
   };
 
-  return units[u] || u || "unit";
+  return (
+    units[u] ||
+    u ||
+    "unit"
+  );
 }
 
-function parseQuantityAndItem(transcript) {
+
+// ============================================================
+// CLEAN ITEM NAME
+// ============================================================
+
+function cleanItemName(item) {
+  if (!item) {
+    return null;
+  }
+
+  const cleaned =
+    String(item)
+      .trim()
+      .replace(
+        /\b(for|from|to|at|by|with)\s*$/i,
+        ""
+      )
+      .replace(
+        /\s+/g,
+        " "
+      )
+      .trim();
+
+  if (!cleaned) {
+    return null;
+  }
+
+  return normalizeItemName(
+    cleaned
+  );
+}
+
+
+// ============================================================
+// QUANTITY + ITEM PARSER
+// ============================================================
+
+function parseQuantityAndItem(
+  transcript
+) {
   /*
    * Handles:
    *
@@ -345,11 +761,14 @@ function parseQuantityAndItem(transcript) {
    * 2 kilograms tomato
    * 2 kg of tomato
    * 5 pieces onions
+   * 10 packets biscuits
+   * 3 boxes chocolates
    */
 
-  const match = transcript.match(
-    /(?:bought|buy|purchase|purchased|sold|sell|selling|got|procured)\s+(\d+(?:\.\d+)?)\s*(kg|kgs|kilogram|kilograms|g|gm|gms|gram|grams|l|litre|litres|liter|liters|ml|millilitre|millilitres|piece|pieces|pcs|bag|bags|box|boxes|packet|packets)\s+(?:of\s+)?(.+?)(?=\s+(?:from|to|for|at|by|with)\b|$)/i
-  );
+  const match =
+    transcript.match(
+      /(?:bought|buy|purchase|purchased|sold|sell|selling|got|procured|get)\s+(\d+(?:\.\d+)?)\s*(kg|kgs|kilogram|kilograms|g|gm|gms|gram|grams|l|litre|litres|liter|liters|ml|millilitre|millilitres|milliliter|milliliters|piece|pieces|pcs|bag|bags|box|boxes|packet|packets)\s+(?:of\s+)?(.+?)(?=\s+(?:from|to|for|at|by|with)\b|[,.]|$)/i
+    );
 
   if (!match) {
     return {
@@ -360,39 +779,43 @@ function parseQuantityAndItem(transcript) {
   }
 
   return {
-    quantity: Number(match[1]),
-    unit: normalizeUnit(match[2]),
-    item: cleanItemName(match[3])
+    quantity:
+      Number(match[1]),
+
+    unit:
+      normalizeUnit(match[2]),
+
+    item:
+      cleanItemName(match[3])
   };
 }
 
-function cleanItemName(item) {
-  if (!item) {
-    return null;
-  }
 
-  return String(item)
-    .trim()
-    .replace(
-      /\b(for|from|to|at|by|with)\s*$/i,
-      ""
-    )
-    .replace(/\s+/g, " ")
-    .trim();
-}
+// ============================================================
+// ITEM WITHOUT QUANTITY
+// ============================================================
 
-function parseItemWithoutQuantity(transcript) {
+function parseItemWithoutQuantity(
+  transcript
+) {
   const patterns = [
-    /(?:bought|purchased|buy|sold|sell)\s+(?:some\s+)?(.+?)(?=\s+(?:from|to|for|at)\b|$)/i,
+    /(?:bought|purchased|buy|sold|sell)\s+(?:some\s+)?(.+?)(?=\s+(?:from|to|for|at)\b|[,.]|$)/i,
 
-    /(?:expense|paid|spent)\s+(?:for\s+)?(.+?)(?=\s+(?:to|from|for|at)\b|$)/i
+    /(?:expense|paid|spent)\s+(?:for\s+)?(.+?)(?=\s+(?:to|from|for|at)\b|[,.]|$)/i
   ];
 
-  for (const pattern of patterns) {
-    const match = transcript.match(pattern);
+  for (
+    const pattern
+    of patterns
+  ) {
+    const match =
+      transcript.match(pattern);
 
     if (match) {
-      const item = cleanItemName(match[1]);
+      const item =
+        cleanItemName(
+          match[1]
+        );
 
       if (item) {
         return item;
@@ -403,7 +826,14 @@ function parseItemWithoutQuantity(transcript) {
   return null;
 }
 
-function parseCounterparty(transcript) {
+
+// ============================================================
+// COUNTERPARTY PARSER
+// ============================================================
+
+function parseCounterparty(
+  transcript
+) {
   const patterns = [
     /\bfrom\s+([A-Za-z][A-Za-z .'-]*?)(?=\s+(?:for|at|with|and)\b|[,.]|$)/i,
 
@@ -414,8 +844,12 @@ function parseCounterparty(transcript) {
     /\bcustomer\s+([A-Za-z][A-Za-z .'-]*?)(?=\s+(?:for|at)\b|[,.]|$)/i
   ];
 
-  for (const pattern of patterns) {
-    const match = transcript.match(pattern);
+  for (
+    const pattern
+    of patterns
+  ) {
+    const match =
+      transcript.match(pattern);
 
     if (match) {
       return match[1].trim();
@@ -425,11 +859,19 @@ function parseCounterparty(transcript) {
   return null;
 }
 
-function detectTransactionType(transcript) {
-  const text = transcript.toLowerCase();
+
+// ============================================================
+// TRANSACTION TYPE
+// ============================================================
+
+function detectTransactionType(
+  transcript
+) {
+  const text =
+    transcript.toLowerCase();
 
   if (
-    /\b(bought|buy|purchase|purchased|procured|get|got)\b/.test(
+    /\b(bought|buy|purchase|purchased|procured|get|got|received stock)\b/.test(
       text
     )
   ) {
@@ -447,29 +889,51 @@ function detectTransactionType(transcript) {
   return "expense";
 }
 
-function parseTranscriptLocally(transcript) {
+
+// ============================================================
+// LOCAL VOICE PARSER
+// ============================================================
+
+function parseTranscriptLocally(
+  transcript
+) {
   console.log(
     "Using local voice transaction parser"
   );
 
   const type =
-    detectTransactionType(transcript);
+    detectTransactionType(
+      transcript
+    );
 
   const parsedQuantity =
-    parseQuantityAndItem(transcript);
+    parseQuantityAndItem(
+      transcript
+    );
 
   const item =
     parsedQuantity.item ||
-    parseItemWithoutQuantity(transcript);
+    parseItemWithoutQuantity(
+      transcript
+    );
+
+  const normalizedItem =
+    normalizeItemName(
+      item
+    );
 
   const quantity =
-    parsedQuantity.quantity || 1;
+    parsedQuantity.quantity ||
+    1;
 
   const unit =
-    parsedQuantity.unit || "unit";
+    parsedQuantity.unit ||
+    "unit";
 
   const totalAmount =
-    parseMoney(transcript);
+    parseMoney(
+      transcript
+    );
 
   let pricePerUnit = 0;
 
@@ -482,62 +946,89 @@ function parseTranscriptLocally(transcript) {
   }
 
   /*
-   * Confidence is based on how much information
-   * was successfully extracted.
+   * Confidence based on
+   * extracted information.
    */
+
   let confidence = 0.35;
 
-  if (item) {
+  if (normalizedItem) {
     confidence += 0.20;
   }
 
-  if (quantity > 0 && unit !== "unit") {
+  if (
+    quantity > 0 &&
+    unit !== "unit"
+  ) {
     confidence += 0.15;
   }
 
-  if (totalAmount !== null) {
+  if (
+    totalAmount !== null
+  ) {
     confidence += 0.15;
   }
 
   const counterparty =
-    parseCounterparty(transcript);
+    parseCounterparty(
+      transcript
+    );
 
   if (counterparty) {
     confidence += 0.10;
   }
 
-  confidence = Math.min(
-    0.95,
-    confidence
-  );
+  confidence =
+    Math.min(
+      0.95,
+      confidence
+    );
 
   return [
     {
-      date: new Date().toISOString(),
+      date:
+        new Date()
+          .toISOString(),
+
       type,
-      item: item || "Unrecognized item",
+
+      item:
+        normalizedItem ||
+        "Unrecognized item",
+
       quantity,
+
       unit,
+
       pricePerUnit,
+
       totalAmount:
         totalAmount !== null
           ? totalAmount
           : 0,
+
       currency: "INR",
+
       counterparty,
+
       confidence
     }
   ];
 }
 
-/*
- * ============================================================
- * BEDROCK FIRST, LOCAL PARSER SECOND
- * ============================================================
- */
 
-async function parseTranscriptWithBedrock(transcript) {
-  const prompt = buildPrompt(transcript);
+// ============================================================
+// BEDROCK FIRST,
+// LOCAL PARSER SECOND
+// ============================================================
+
+async function parseTranscriptWithBedrock(
+  transcript
+) {
+  const prompt =
+    buildPrompt(
+      transcript
+    );
 
   console.log(
     "Sending transcript to Bedrock:",
@@ -546,7 +1037,9 @@ async function parseTranscriptWithBedrock(transcript) {
 
   try {
     const response =
-      await invokeBedrock(prompt);
+      await invokeBedrock(
+        prompt
+      );
 
     console.log(
       "Raw Bedrock response:",
@@ -568,12 +1061,17 @@ async function parseTranscriptWithBedrock(transcript) {
     );
 
     const parsed =
-      extractJsonFromText(text);
+      extractJsonFromText(
+        text
+      );
 
     let transactions;
 
-    if (Array.isArray(parsed)) {
-      transactions = parsed;
+    if (
+      Array.isArray(parsed)
+    ) {
+      transactions =
+        parsed;
     } else if (
       parsed &&
       Array.isArray(
@@ -588,7 +1086,9 @@ async function parseTranscriptWithBedrock(transcript) {
       );
     }
 
-    if (transactions.length === 0) {
+    if (
+      transactions.length === 0
+    ) {
       throw new Error(
         "Bedrock returned no transactions"
       );
@@ -601,6 +1101,7 @@ async function parseTranscriptWithBedrock(transcript) {
           transcript
         )
     );
+
   } catch (bedrockError) {
     console.error(
       "Bedrock unavailable. Falling back to local parser:",
@@ -608,28 +1109,44 @@ async function parseTranscriptWithBedrock(transcript) {
     );
 
     /*
-     * IMPORTANT:
+     * Do NOT create
+     * "Review voice entry".
      *
-     * Do NOT create "Review voice entry".
-     * Parse the transcript locally so the application
-     * still works when Bedrock quota/access is unavailable.
+     * Parse locally so the app
+     * continues working when
+     * Bedrock access/quota fails.
      */
+
     return parseTranscriptLocally(
       transcript
     );
   }
 }
 
-/*
- * ============================================================
- * SAVE TRANSACTION
- * ============================================================
- */
 
-async function saveTransaction(transaction) {
-  const normalized =
+// ============================================================
+// SAVE TRANSACTION
+// ============================================================
+
+async function saveTransaction(
+  transaction
+) {
+  let normalized =
     normalizeTransaction(
       transaction
+    );
+
+  /*
+   * FINAL ITEM NORMALIZATION BARRIER
+   *
+   * Even if some earlier path
+   * missed normalization,
+   * nothing plural reaches
+   * DynamoDB for common forms.
+   */
+  normalized.item =
+    normalizeItemName(
+      normalized.item
     );
 
   const validation =
@@ -637,7 +1154,9 @@ async function saveTransaction(transaction) {
       normalized
     );
 
-  if (!validation.valid) {
+  if (
+    !validation.valid
+  ) {
     throw new Error(
       `Invalid transaction: ${validation.errors.join(
         ", "
@@ -647,7 +1166,8 @@ async function saveTransaction(transaction) {
 
   await dynamodb.send(
     new PutItemCommand({
-      TableName: TABLE_NAME,
+      TableName:
+        TABLE_NAME,
 
       Item: {
         userId: {
@@ -655,7 +1175,8 @@ async function saveTransaction(transaction) {
         },
 
         transactionId: {
-          S: normalized.transactionId
+          S:
+            normalized.transactionId
         },
 
         date: {
@@ -722,20 +1243,22 @@ async function saveTransaction(transaction) {
   return normalized;
 }
 
-/*
- * ============================================================
- * AWS TRANSCRIBE PATH
- * ============================================================
- */
 
-async function transcribeFromS3(s3Key) {
+// ============================================================
+// AWS TRANSCRIBE PATH
+// ============================================================
+
+async function transcribeFromS3(
+  s3Key
+) {
   const jobName =
     `voice-${crypto.randomUUID()}`;
 
   console.log(
     "Starting transcription:",
     {
-      bucket: BUCKET_NAME,
+      bucket:
+        BUCKET_NAME,
       s3Key
     }
   );
@@ -750,12 +1273,14 @@ async function transcribeFromS3(s3Key) {
           `s3://${BUCKET_NAME}/${s3Key}`
       },
 
-      MediaFormat: "webm",
+      MediaFormat:
+        "webm",
 
       MediaSampleRateHertz:
         48000,
 
-      LanguageCode: "en-IN",
+      LanguageCode:
+        "en-IN",
 
       OutputBucketName:
         BUCKET_NAME
@@ -815,8 +1340,15 @@ async function transcribeFromS3(s3Key) {
     );
   }
 
+  /*
+   * AWS Transcribe returns a URL
+   * to the transcript JSON.
+   */
+
   const url =
-    new URL(transcriptUri);
+    new URL(
+      transcriptUri
+    );
 
   const bucket =
     url.hostname.split(".")[0];
@@ -832,8 +1364,11 @@ async function transcribeFromS3(s3Key) {
   const transcriptObject =
     await s3.send(
       new GetObjectCommand({
-        Bucket: bucket,
-        Key: key
+        Bucket:
+          bucket,
+
+        Key:
+          key
       })
     );
 
@@ -859,200 +1394,275 @@ async function transcribeFromS3(s3Key) {
   return transcript;
 }
 
-/*
- * ============================================================
- * LAMBDA HANDLER
- * ============================================================
- */
 
-exports.handler = async (
-  event
-) => {
-  try {
-    const body =
-      JSON.parse(
-        event.body || "{}"
-      );
+// ============================================================
+// LAMBDA HANDLER
+// ============================================================
 
-    const userId =
-      body.userId;
-
-    const s3Key =
-      body.s3Key;
-
-    const suppliedTranscript =
-      body.transcript;
-
-    if (
-      userId !== "demo-user"
-    ) {
-      return error(
-        "Invalid userId",
-        400
-      );
-    }
-
-    let transcript;
-
-    /*
-     * Browser Web Speech API path.
-     */
-    if (
-      typeof suppliedTranscript ===
-        "string" &&
-      suppliedTranscript.trim()
-    ) {
-      transcript =
-        suppliedTranscript.trim();
-
-      console.log(
-        "Using supplied browser transcript"
-      );
-    } else {
-      /*
-       * AWS Transcribe path.
-       */
-      if (!s3Key) {
-        return error(
-          "Either transcript or s3Key is required",
-          400
+exports.handler =
+  async (event) => {
+    try {
+      const body =
+        JSON.parse(
+          event.body ||
+            "{}"
         );
-      }
+
+      const userId =
+        body.userId;
+
+      const s3Key =
+        body.s3Key;
+
+      const suppliedTranscript =
+        body.transcript;
+
+      // -------------------------
+      // Validate user
+      // -------------------------
 
       if (
-        !s3Key.startsWith(
-          `uploads/${userId}/`
-        )
+        userId !==
+        "demo-user"
       ) {
         return error(
-          "Invalid s3Key",
+          "Invalid userId",
           400
         );
       }
 
-      transcript =
-        await transcribeFromS3(
-          s3Key
+      let transcript;
+
+      // ========================================================
+      // PATH 1:
+      // Browser Web Speech API transcript
+      // ========================================================
+
+      if (
+        typeof suppliedTranscript ===
+          "string" &&
+        suppliedTranscript.trim()
+      ) {
+        transcript =
+          suppliedTranscript
+            .trim();
+
+        console.log(
+          "Using supplied browser transcript:",
+          transcript
         );
-    }
 
-    console.log(
-      "Final transcript:",
-      transcript
-    );
+      } else {
 
-    /*
-     * Bedrock first.
-     * Local parser automatically takes over
-     * if Bedrock is unavailable.
-     */
-    const parsedTransactions =
-      await parseTranscriptWithBedrock(
+        // ======================================================
+        // PATH 2:
+        // AWS Transcribe from S3
+        // ======================================================
+
+        if (!s3Key) {
+          return error(
+            "Either transcript or s3Key is required",
+            400
+          );
+        }
+
+        const expectedPrefix =
+          `uploads/${userId}/`;
+
+        if (
+          !s3Key.startsWith(
+            expectedPrefix
+          )
+        ) {
+          return error(
+            "Invalid s3Key",
+            400
+          );
+        }
+
+        transcript =
+          await transcribeFromS3(
+            s3Key
+          );
+      }
+
+      console.log(
+        "Final transcript:",
         transcript
       );
 
-    const transactions = [];
+      // ========================================================
+      // BEDROCK FIRST
+      // LOCAL PARSER FALLBACK
+      // ========================================================
 
-    for (
-      const parsed of parsedTransactions
-    ) {
-      const transaction =
-        normalizeTransaction({
-          ...parsed,
-
-          transactionId:
-            crypto.randomUUID(),
-
-          userId,
-
-          source: "voice",
-
-          rawInput:
-            transcript
-        });
-
-      const validation =
-        validateTransaction(
-          transaction
+      const parsedTransactions =
+        await parseTranscriptWithBedrock(
+          transcript
         );
 
-      if (!validation.valid) {
-        console.error(
-          "Invalid parsed transaction:",
-          validation.errors,
-          transaction
-        );
+      const transactions =
+        [];
+
+      // ========================================================
+      // Normalize + validate + save
+      // ========================================================
+
+      for (
+        const parsed
+        of parsedTransactions
+      ) {
 
         /*
-         * Try local parsing once more
-         * instead of returning Review voice entry.
+         * Extra defensive normalization.
          */
-        const local =
-          parseTranscriptLocally(
-            transcript
-          )[0];
+        const normalizedItem =
+          normalizeItemName(
+            parsed.item
+          );
 
-        const fallbackTransaction =
+        const transaction =
           normalizeTransaction({
-            ...local,
+            ...parsed,
 
             transactionId:
               crypto.randomUUID(),
 
             userId,
 
-            source: "voice",
+            source:
+              "voice",
 
             rawInput:
-              transcript
+              transcript,
+
+            item:
+              normalizedItem
           });
 
-        const fallbackValidation =
+        /*
+         * FINAL NORMALIZATION
+         *
+         * This is the last protection
+         * against Bedrock/local-parser
+         * variation.
+         */
+        transaction.item =
+          normalizeItemName(
+            transaction.item
+          );
+
+        const validation =
           validateTransaction(
-            fallbackTransaction
+            transaction
           );
 
         if (
-          !fallbackValidation.valid
+          !validation.valid
         ) {
-          throw new Error(
-            `Unable to parse voice transaction: ${fallbackValidation.errors.join(
-              ", "
-            )}`
+          console.error(
+            "Invalid parsed transaction:",
+            validation.errors,
+            transaction
           );
+
+          /*
+           * Try local parsing once more.
+           */
+          const local =
+            parseTranscriptLocally(
+              transcript
+            )[0];
+
+          const fallbackTransaction =
+            normalizeTransaction({
+              ...local,
+
+              transactionId:
+                crypto.randomUUID(),
+
+              userId,
+
+              source:
+                "voice",
+
+              rawInput:
+                transcript,
+
+              item:
+                normalizeItemName(
+                  local.item
+                )
+            });
+
+          /*
+           * Final normalization barrier
+           */
+          fallbackTransaction.item =
+            normalizeItemName(
+              fallbackTransaction.item
+            );
+
+          const fallbackValidation =
+            validateTransaction(
+              fallbackTransaction
+            );
+
+          if (
+            !fallbackValidation.valid
+          ) {
+            throw new Error(
+              `Unable to parse voice transaction: ${fallbackValidation.errors.join(
+                ", "
+              )}`
+            );
+          }
+
+          const saved =
+            await saveTransaction(
+              fallbackTransaction
+            );
+
+          transactions.push(
+            saved
+          );
+
+          continue;
         }
 
         const saved =
           await saveTransaction(
-            fallbackTransaction
+            transaction
           );
 
-        transactions.push(saved);
-
-        continue;
+        transactions.push(
+          saved
+        );
       }
 
-      const saved =
-        await saveTransaction(
-          transaction
-        );
+      // ========================================================
+      // RESPONSE
+      // ========================================================
 
-      transactions.push(saved);
+      return success({
+        transactions,
+
+        /*
+         * Return exact original transcript
+         * to frontend.
+         */
+        transcript
+      });
+
+    } catch (err) {
+      console.error(
+        "processVoice error:",
+        err
+      );
+
+      return error(
+        "Unable to process the uploaded voice recording",
+        500
+      );
     }
-
-    return success({
-      transactions,
-      transcript
-    });
-  } catch (err) {
-    console.error(
-      "processVoice error:",
-      err
-    );
-
-    return error(
-      "Unable to process the uploaded voice recording",
-      500
-    );
-  }
-};
+  };
