@@ -7,7 +7,7 @@ s3_prefix = "sam-app"
 region = "ap-south-1"
 confirm_changeset = true
 capabilities = "CAPABILITY_IAM CAPABILITY_NAMED_IAM"
-parameter_overrides = "TableName=\"Transactions\" AmplifyOrigin=\"http://localhost:5173\" BedrockModelId=\"global.anthropic.claude-sonnet-4-6\" StageName=\"Prod\""
+parameter_overrides = "TableName=\"Transactions\" AmplifyOrigin=\"http://localhost:5173\" BedrockModelId=\"global.anthropic.claude-haiku-4-5-20251001-v1:0\" StageName=\"Prod\""
 image_repositories = []
 
 [default.global.parameters]
